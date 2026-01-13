@@ -20,16 +20,16 @@ Configure via `/etc/hyproxy/config.json` or `HYPROXY_BACKEND` env. Reload with `
 ### Docker
 
 ```bash
-docker run -p 5520:5520/udp -e HYPROXY_BACKEND=your-server:5520 ghcr.io/hybuild-net/hyproxy
+docker run -p 5520:5520/udp -e HYPROXY_BACKEND=your-server:5520 ghcr.io/hybuild-net/hyproxy:latest
 ```
 
 ```bash
-podman run -p 5520:5520/udp -e HYPROXY_BACKEND=your-server:5520 ghcr.io/hybuild-net/hyproxy
+podman run -p 5520:5520/udp -e HYPROXY_BACKEND=your-server:5520 ghcr.io/hybuild-net/hyproxy:latest
 ```
 
 Or mount your config:
 ```bash
-docker run -p 5520:5520/udp -v /path/to/config.json:/data/config.json ghcr.io/hybuild-net/hyproxy
+docker run -p 5520:5520/udp -v /path/to/config.json:/data/config.json ghcr.io/hybuild-net/hyproxy:latest
 ```
 
 ## Handlers
