@@ -2,7 +2,15 @@
   "listen": ":5520",
   "handlers": [
     {"type": "logsni"},
-    {"type": "simple-router"},
+    {
+      "type": "sni-router",
+      "config": {
+        "routes": {
+          "play.example.com": "127.0.0.1:5521",
+          "lobby.example.com": "127.0.0.1:5522"
+        }
+      }
+    },
     {"type": "forwarder"}
   ]
 }

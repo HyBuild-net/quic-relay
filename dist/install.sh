@@ -85,7 +85,15 @@ install_config() {
   "listen": ":5520",
   "handlers": [
     {"type": "logsni"},
-    {"type": "simple-router"},
+    {
+      "type": "sni-router",
+      "config": {
+        "routes": {
+          "play.example.com": "127.0.0.1:5521",
+          "lobby.example.com": "127.0.0.1:5522"
+        }
+      }
+    },
     {"type": "forwarder"}
   ]
 }
@@ -115,6 +123,13 @@ enable_service() {
     systemctl enable hyproxy
 }
 
+restart_if_running() {
+    if systemctl is-active --quiet hyproxy; then
+        log_info "Restarting hyproxy service..."
+        systemctl restart hyproxy
+    fi
+}
+
 main() {
     echo ""
     echo "  HyProxy Installer"
@@ -133,6 +148,7 @@ main() {
     install_config
     install_service
     enable_service
+    restart_if_running
 
     echo ""
     log_info "Installation complete!"
