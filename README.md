@@ -1,5 +1,7 @@
 # HyProxy
 
+[![CI](https://github.com/HyBuild-net/HyProxy/actions/workflows/ci.yml/badge.svg)](https://github.com/HyBuild-net/HyProxy/actions/workflows/ci.yml)
+
 A reverse proxy for Hytale servers. Route players to different backends based on the domain they connect to, enabling multiple servers behind a single IP address.
 
 ## Build
