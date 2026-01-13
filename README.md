@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="dist/logo.png" alt="HyProxy" width="200">
+</p>
+
 # HyProxy
 
 [![CI](https://github.com/HyBuild-net/HyProxy/actions/workflows/ci.yml/badge.svg)](https://github.com/HyBuild-net/HyProxy/actions/workflows/ci.yml)
@@ -6,18 +10,27 @@ A reverse proxy for Hytale servers. Route players to different backends based on
 
 ## Quickstart
 
-**Docker:**
-```bash
-docker run -p 5520:5520/udp -e HYPROXY_BACKEND=your-server:5520 ghcr.io/hybuild-net/hyproxy
-```
-
-**Linux:**
 ```bash
 curl -sSL https://raw.githubusercontent.com/HyBuild-net/HyProxy/master/dist/install.sh | sudo bash
 sudo systemctl enable --now hyproxy
 ```
 
 Configure via `/etc/hyproxy/config.json` or `HYPROXY_BACKEND` env. Reload with `systemctl reload hyproxy`.
+
+### Docker
+
+```bash
+docker run -p 5520:5520/udp -e HYPROXY_BACKEND=your-server:5520 ghcr.io/hybuild-net/hyproxy
+```
+
+```bash
+podman run -p 5520:5520/udp -e HYPROXY_BACKEND=your-server:5520 ghcr.io/hybuild-net/hyproxy
+```
+
+Or mount your config:
+```bash
+docker run -p 5520:5520/udp -v /path/to/config.json:/data/config.json ghcr.io/hybuild-net/hyproxy
+```
 
 ## Handlers
 
