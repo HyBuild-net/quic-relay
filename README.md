@@ -14,7 +14,7 @@ And therefore a QUIC-Proxy might be the only convenient way for achieving standa
 flowchart LR
     A[Player A] -->|play.example.com| P[HyProxy :5520] --> S1[play.example.com]
     B[Player B] -->|lobby.example.com| P --> S2[127.0.0.1:5521]
-    C[Player C] -->|minigames.example.com| P --> S3[minigames.example.com:67344]
+    C[Player C] -->|minigames.example.com| P --> S3[minigames.dev:67344]
 ```
 
 ## Quickstart
