@@ -12,18 +12,9 @@ And therefore a QUIC-Proxy might be the only convenient way for achieving standa
 
 ```mermaid
 flowchart LR
-    C[Clients]
-    P[HyProxy :5520]
-    S1[play.example.com]
-    S2[lobby.example.com]
-    S3[minigames.example.com]
-
-    C -->|play.example.com| P
-    C -->|lobby.example.com| P
-    C -->|minigames.example.com| P
-    P --> S1
-    P --> S2
-    P --> S3
+    A[Player A] -->|play.example.com| P[HyProxy :5520] --> S1[play.example.com]
+    B[Player B] -->|lobby.example.com| P --> S2[lobby.example.com]
+    C[Player C] -->|minigames.example.com| P --> S3[minigames.example.com]
 ```
 
 ## Quickstart
