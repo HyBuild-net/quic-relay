@@ -7,38 +7,17 @@ A reverse proxy for Hytale servers. Route players to different backends based on
 ## Quickstart
 
 **Docker:**
+ ```bash
+podman run -p 5520:5520/udp -e HYPROXY_BACKEND=your-server:5520 ghcr.io/hybuild-net/hyproxy
+```
+
 ```bash
 docker run -p 5520:5520/udp -e HYPROXY_BACKEND=your-server:5520 ghcr.io/hybuild-net/hyproxy
 ```
 
-**Binary:**
-```bash
-# Download
-curl -LO https://github.com/HyBuild-net/HyProxy/releases/latest/download/hyproxy-linux-amd64
-chmod +x hyproxy-linux-amd64
-
-# Run
-HYPROXY_BACKEND=your-server:5520 ./hyproxy-linux-amd64 -config '{"handlers":[{"type":"simple-router"},{"type":"forwarder"}]}'
-```
-
-For advanced setups with SNI routing or load balancing, see [Handlers](#handlers).
-
-## Build
-
-```bash
-make build
-```
-
-Produces `bin/proxy`.
-
-## Usage
-
-```bash
-# With config file
-./bin/proxy -config config.json
-
-# With inline JSON
-./bin/proxy -config '{"listen":":5520","handlers":[{"type":"simple-router","config":{"backend":"10.0.0.1:5520"}},{"type":"forwarder"}]}'
+Or mount your config:
+ ```bash
+docker run ... -v /path/to/config:/data ...
 ```
 
 ### Signals
@@ -118,6 +97,14 @@ Logs the SNI of each connection. Useful for debugging.
 Environment variables as fallback when not set in config:
 - `HYPROXY_LISTEN` - Listen address (default: `:5520`)
 - `HYPROXY_BACKEND` - Backend address for `simple-router`
+
+## Build
+
+```bash
+make build
+```
+
+Produces `bin/proxy`.
 
 ## License
 
