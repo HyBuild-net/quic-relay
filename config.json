@@ -1,17 +1,8 @@
 {
   "listen": ":5520",
   "handlers": [
-    {
-      "type": "example"
-    },
-    {
-      "type": "simple-router",
-      "config": {
-        "backend": "localhost:4433"
-      }
-    },
-    {
-      "type": "forwarder"
-    }
+    {"type": "logsni"},
+    {"type": "simple-router"},
+    {"type": "forwarder"}
   ]
 }

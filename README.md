@@ -4,6 +4,25 @@
 
 A reverse proxy for Hytale servers. Route players to different backends based on the domain they connect to, enabling multiple servers behind a single IP address.
 
+## Quickstart
+
+**Docker:**
+```bash
+docker run -p 5520:5520/udp -e HYPROXY_BACKEND=your-server:5520 ghcr.io/hybuild-net/hyproxy
+```
+
+**Binary:**
+```bash
+# Download
+curl -LO https://github.com/HyBuild-net/HyProxy/releases/latest/download/hyproxy-linux-amd64
+chmod +x hyproxy-linux-amd64
+
+# Run
+HYPROXY_BACKEND=your-server:5520 ./hyproxy-linux-amd64 -config '{"handlers":[{"type":"simple-router"},{"type":"forwarder"}]}'
+```
+
+For advanced setups with SNI routing or load balancing, see [Handlers](#handlers).
+
 ## Build
 
 ```bash
@@ -96,7 +115,9 @@ Logs the SNI of each connection. Useful for debugging.
 
 ## Advanced
 
-If `listen` is not set in the config, the environment variable `HYPROXY_LISTEN` is used as fallback (default: `:5520`).
+Environment variables as fallback when not set in config:
+- `HYPROXY_LISTEN` - Listen address (default: `:5520`)
+- `HYPROXY_BACKEND` - Backend address for `simple-router`
 
 ## License
 

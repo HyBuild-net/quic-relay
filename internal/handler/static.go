@@ -3,6 +3,7 @@ package handler
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"sync/atomic"
 )
 
@@ -36,8 +37,10 @@ func NewStaticHandler(raw json.RawMessage) (Handler, error) {
 		backends = cfg.Backends
 	} else if cfg.Backend != "" {
 		backends = []string{cfg.Backend}
+	} else if env := os.Getenv("HYPROXY_BACKEND"); env != "" {
+		backends = []string{env}
 	} else {
-		return nil, fmt.Errorf("static handler requires 'backend' or 'backends' config")
+		return nil, fmt.Errorf("simple-router requires 'backend', 'backends' config or HYPROXY_BACKEND env")
 	}
 
 	return &StaticHandler{backends: backends}, nil
