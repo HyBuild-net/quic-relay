@@ -79,6 +79,7 @@ Routes all connections to one or more backends. Use `backend` for a single desti
 {
   "listen": ":5520",
   "handlers": [
+    {"type": "ratelimit-global", "config": {"max_parallel_connections": 10000}},
     {
       "type": "simple-router",
       "config": {
@@ -89,6 +90,10 @@ Routes all connections to one or more backends. Use `backend` for a single desti
   ]
 }
 ```
+
+### ratelimit-global
+
+Limits the total number of concurrent connections. New connections are dropped when the limit is reached.
 
 ### forwarder
 

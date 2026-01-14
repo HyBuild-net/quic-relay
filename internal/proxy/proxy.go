@@ -428,6 +428,8 @@ func (p *Proxy) handlePacket(clientAddr *net.UDPAddr, packet []byte) {
 		Hello:         hello,
 		ProxyConn:     p.conn,
 	}
+	// Set session count for rate limiters
+	newCtx.Set("_session_count", p.sessionCount.Load())
 
 	// Set callback to learn server's SCID from first response packet
 	// This enables routing subsequent client packets that use server's CID

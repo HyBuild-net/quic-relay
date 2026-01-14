@@ -211,3 +211,13 @@ func (c *Context) GetBool(key string) bool {
 	}
 	return false
 }
+
+// GetInt64 retrieves an int64 value from the context.
+func (c *Context) GetInt64(key string) int64 {
+	if v, ok := c.Get(key); ok {
+		if i, ok := v.(int64); ok {
+			return i
+		}
+	}
+	return 0
+}
