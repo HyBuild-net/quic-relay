@@ -1,6 +1,7 @@
 {
   "name": "quic-relay-docs",
   "private": true,
+  "type": "module",
   "scripts": {
     "dev": "vitepress dev",
     "build": "vitepress build",
