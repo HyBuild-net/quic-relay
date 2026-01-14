@@ -7,6 +7,8 @@ import (
 	"net"
 	"sync/atomic"
 	"time"
+
+	"quic-relay/internal/debug"
 )
 
 func init() {
@@ -97,6 +99,7 @@ func (h *ForwarderHandler) OnPacket(ctx *Context, packet []byte, dir Direction) 
 
 	if dir == Inbound {
 		// Client -> Backend
+		debug.Printf(" client->backend: %d bytes, first byte: 0x%02x", len(packet), packet[0])
 		_, err := ctx.Session.BackendConn.Write(packet)
 		if err != nil {
 			log.Printf("[forwarder] write to backend failed: %v", err)
@@ -152,9 +155,11 @@ func (h *ForwarderHandler) backendToClient(ctx *Context, session *Session) {
 		// Update activity timestamp (bidirectional tracking)
 		session.Touch()
 
-		// Notify proxy of first server packet to learn server's SCID
+		// Notify proxy of server packets to learn server's SCID(s)
 		// This enables routing subsequent client packets that use server's CID as DCID
-		ctx.NotifyFirstServerPacket((*buf)[:n])
+		ctx.NotifyServerPacket((*buf)[:n])
+
+		debug.Printf(" backend->client: %d bytes, first byte: 0x%02x", n, (*buf)[0])
 
 		// Send to client via proxy's UDP connection
 		if ctx.ProxyConn != nil {
@@ -164,6 +169,7 @@ func (h *ForwarderHandler) backendToClient(ctx *Context, session *Session) {
 				PutBuffer(buf)
 				return
 			}
+			debug.Printf(" sent to client %s", session.ClientAddr())
 		}
 
 		// Return buffer to pool after use

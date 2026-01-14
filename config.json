@@ -3,9 +3,19 @@
   "handlers": [
     {"type": "logsni"},
     {
-      "type": "simple-router",
+      "type": "sni-router",
       "config": {
-        "backend": "hybuild.net:5520"
+        "routes": {
+          "test.local": "127.0.0.1:4433"
+        }
+      }
+    },
+    {
+      "type": "terminator",
+      "config": {
+        "listen": ":5522",
+        "cert": "server.crt",
+        "key": "server.key"
       }
     },
     {"type": "forwarder"}

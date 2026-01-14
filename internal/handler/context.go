@@ -45,7 +45,6 @@ type ClientHello struct {
 type Session struct {
 	ID           uint64
 	DCID         []byte                      // Destination Connection ID from Initial packet (session key)
-	ServerSCID   []byte                      // Server's SCID from Initial response (alias key for routing)
 	clientAddr   atomic.Pointer[net.UDPAddr] // Current client address (atomic for connection migration)
 	BackendAddr  *net.UDPAddr
 	BackendConn  *net.UDPConn
@@ -112,11 +111,10 @@ type Context struct {
 	// ProxyConn is a reference to the proxy's UDP connection for sending responses.
 	ProxyConn *net.UDPConn
 
-	// OnFirstServerPacket is called once with the first Long Header packet from backend.
-	// Used by proxy to learn server's SCID for DCID-based routing.
+	// OnServerPacket is called for every Long Header packet from backend.
+	// Used by proxy to learn server's SCID(s) for DCID-based routing.
 	// Set by proxy before passing context to handlers.
-	OnFirstServerPacket     func(packet []byte)
-	firstServerPacketCalled atomic.Bool
+	OnServerPacket func(packet []byte)
 
 	// DropSession immediately removes the session from the proxy.
 	// Set by proxy after session is stored. Safe to call multiple times (idempotent).
@@ -129,11 +127,12 @@ type Context struct {
 	mu     sync.RWMutex
 }
 
-// NotifyFirstServerPacket calls OnFirstServerPacket callback exactly once.
-// Safe to call multiple times - only the first call invokes the callback.
-func (c *Context) NotifyFirstServerPacket(packet []byte) {
-	if c.OnFirstServerPacket != nil && !c.firstServerPacketCalled.Swap(true) {
-		c.OnFirstServerPacket(packet)
+// NotifyServerPacket calls OnServerPacket callback for Long Header packets.
+// Used to learn new SCIDs from the server during handshake.
+func (c *Context) NotifyServerPacket(packet []byte) {
+	if c.OnServerPacket != nil && len(packet) > 0 && (packet[0]&0x80) != 0 {
+		// Only call for Long Header packets (first bit = 1)
+		c.OnServerPacket(packet)
 	}
 }
 

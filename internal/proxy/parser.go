@@ -151,6 +151,120 @@ func ExtractSCID(packet []byte) ([]byte, error) {
 	return packet[offset : offset+scidLen], nil
 }
 
+// ExtractDCIDAndSCID extracts both DCID and SCID from a Long Header packet.
+// Returns (dcid, scid, error).
+func ExtractDCIDAndSCID(packet []byte) ([]byte, []byte, error) {
+	if len(packet) < 1 {
+		return nil, nil, errors.New("packet too short")
+	}
+
+	// Short Header has no SCID
+	if packet[0]&0x80 == 0 {
+		return nil, nil, errors.New("short header")
+	}
+
+	if len(packet) < 6 {
+		return nil, nil, errors.New("packet too short for long header")
+	}
+
+	offset := 5 // Skip first byte + version (4 bytes)
+	dcidLen := int(packet[offset])
+	offset++
+
+	if offset+dcidLen > len(packet) {
+		return nil, nil, errors.New("packet too short for DCID")
+	}
+	dcid := packet[offset : offset+dcidLen]
+	offset += dcidLen
+
+	if offset >= len(packet) {
+		return nil, nil, errors.New("packet too short for SCID length")
+	}
+
+	scidLen := int(packet[offset])
+	offset++
+
+	if offset+scidLen > len(packet) {
+		return nil, nil, errors.New("packet too short for SCID")
+	}
+	scid := packet[offset : offset+scidLen]
+
+	return dcid, scid, nil
+}
+
+// ExtractAllSCIDs extracts SCIDs from all coalesced packets in a UDP datagram.
+// QUIC allows multiple packets to be coalesced in a single datagram.
+// The server may use different SCIDs for Initial and Handshake phases.
+func ExtractAllSCIDs(datagram []byte) [][]byte {
+	var scids [][]byte
+	seen := make(map[string]bool)
+
+	offset := 0
+	for offset < len(datagram) {
+		if offset+1 > len(datagram) {
+			break
+		}
+
+		// Check if Long Header (first bit = 1)
+		if datagram[offset]&0x80 == 0 {
+			// Short Header - no more Long Header packets possible
+			break
+		}
+
+		// Parse Long Header to extract SCID and find packet length
+		pkt := datagram[offset:]
+		if len(pkt) < 6 {
+			break
+		}
+
+		// Skip header byte (1) + version (4)
+		headerOffset := 5
+		dcidLen := int(pkt[headerOffset])
+		headerOffset++
+		headerOffset += dcidLen
+
+		if headerOffset >= len(pkt) {
+			break
+		}
+
+		scidLen := int(pkt[headerOffset])
+		headerOffset++
+
+		if headerOffset+scidLen > len(pkt) {
+			break
+		}
+
+		scid := pkt[headerOffset : headerOffset+scidLen]
+		scidKey := string(scid)
+		if !seen[scidKey] && len(scid) > 0 {
+			seen[scidKey] = true
+			scidCopy := make([]byte, len(scid))
+			copy(scidCopy, scid)
+			scids = append(scids, scidCopy)
+		}
+		headerOffset += scidLen
+
+		// Read variable-length packet length field
+		if headerOffset >= len(pkt) {
+			break
+		}
+		pktLen, lenBytes, err := readVarInt(pkt[headerOffset:])
+		if err != nil || lenBytes == 0 {
+			break
+		}
+		headerOffset += lenBytes
+
+		// Move to next packet (header + payload length)
+		nextOffset := headerOffset + int(pktLen)
+		if nextOffset <= 0 || nextOffset > len(pkt) {
+			break // Invalid length or end of datagram
+		}
+		offset += nextOffset
+	}
+
+	return scids
+}
+
 // PacketTypeError is returned when a packet is not the expected type
 type PacketTypeError struct {
 	Expected PacketType

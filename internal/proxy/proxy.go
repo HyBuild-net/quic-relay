@@ -251,6 +251,7 @@ type Proxy struct {
 	assemblers     sync.Map                      // DCID (string) -> *CryptoAssembler
 	pendingPackets sync.Map                      // DCID (string) -> *pendingBuffer (out-of-order packets)
 	dcidAliases    sync.Map                      // Server SCID (string) -> original DCID (string)
+	clientSessions sync.Map                      // Client address (string) -> original DCID (string)
 	workerPool     *WorkerPool
 	ctx            context.Context
 	cancel         context.CancelFunc
@@ -362,8 +363,8 @@ func (p *Proxy) handlePacket(clientAddr *net.UDPAddr, packet []byte) {
 	pktType := ClassifyPacket(packet)
 	debug.Printf(" packet type: %s", pktType)
 
-	// 1. Try to find existing session by DCID
-	ctx, dcid := p.findSession(packet, pktType)
+	// 1. Try to find existing session by DCID (with client address fallback)
+	ctx, dcid := p.findSession(packet, pktType, clientAddr)
 	if ctx != nil {
 		// Connection Migration: update client address if changed (atomic)
 		currentAddr := ctx.Session.ClientAddr()
@@ -371,6 +372,13 @@ func (p *Proxy) handlePacket(clientAddr *net.UDPAddr, packet []byte) {
 			log.Printf("[proxy] connection migration: %s -> %s (DCID=%x)",
 				currentAddr, clientAddr, ctx.Session.DCID)
 			ctx.Session.SetClientAddr(clientAddr)
+
+			// Update clientSessions mapping for the new address
+			dcidKey := string(ctx.Session.DCID)
+			oldKey := currentAddr.String()
+			newKey := clientAddr.String()
+			p.clientSessions.Delete(oldKey)
+			p.clientSessions.Store(newKey, dcidKey)
 		}
 
 		// Forward packet through handler chain
@@ -455,9 +463,9 @@ func (p *Proxy) handlePacket(clientAddr *net.UDPAddr, packet []byte) {
 	// Set session count for rate limiters
 	newCtx.Set("_session_count", p.sessionCount.Load())
 
-	// Set callback to learn server's SCID from first response packet
+	// Set callback to learn server's SCID(s) from response packets
 	// This enables routing subsequent client packets that use server's CID
-	newCtx.OnFirstServerPacket = func(packet []byte) {
+	newCtx.OnServerPacket = func(packet []byte) {
 		p.learnServerSCID(dcidKey, newCtx, packet)
 	}
 
@@ -481,6 +489,11 @@ func (p *Proxy) handlePacket(clientAddr *net.UDPAddr, packet []byte) {
 		// Store session by DCID
 		p.storeSession(dcidKey, newCtx)
 
+		// Also store by client address for fallback lookup
+		// (handles cases where client uses CIDs we don't know about)
+		clientKey := clientAddr.String()
+		p.clientSessions.Store(clientKey, dcidKey)
+
 		// Flush any packets that arrived before this Initial (out-of-order)
 		p.flushPendingPackets(dcidKey, newCtx)
 
@@ -496,7 +509,8 @@ func (p *Proxy) handlePacket(clientAddr *net.UDPAddr, packet []byte) {
 // For Long Header packets, DCID is extracted directly.
 // For Short Header packets, tries all known DCID lengths.
 // Also checks dcidAliases for server's SCID -> original DCID mapping.
-func (p *Proxy) findSession(packet []byte, pktType PacketType) (*handler.Context, []byte) {
+// Falls back to client address lookup if DCID-based lookups fail.
+func (p *Proxy) findSession(packet []byte, pktType PacketType, clientAddr *net.UDPAddr) (*handler.Context, []byte) {
 	if pktType == PacketShortHeader {
 		// Short Header: try all known DCID lengths (longest first to avoid prefix collisions)
 		p.dcidLengthsMu.RLock()
@@ -526,25 +540,62 @@ func (p *Proxy) findSession(packet []byte, pktType PacketType) (*handler.Context
 				}
 			}
 		}
+
+		// Fallback: lookup by client address for Short Header packets too
+		// This is needed when server issues NEW_CONNECTION_ID in encrypted frames
+		if clientAddr != nil {
+			clientKey := clientAddr.String()
+			if originalDCID, ok := p.clientSessions.Load(clientKey); ok {
+				debug.Printf(" findSession (short): trying client address fallback (%s)", clientKey)
+				if val, ok := p.sessions.Load(originalDCID.(string)); ok {
+					debug.Printf(" findSession (short): found session via client address")
+					return val.(*handler.Context), nil
+				}
+			}
+		}
+
 		return nil, nil
 	}
 
 	// Long Header: DCID length is in packet
 	dcid, err := ExtractDCID(packet, 0)
 	if err != nil {
+		debug.Printf(" findSession: failed to extract DCID: %v", err)
 		return nil, nil
 	}
 	dcidKey := string(dcid)
 
+	debug.Printf(" findSession: DCID=%x (len=%d)", dcid, len(dcid))
+
 	// Direct lookup
 	if val, ok := p.sessions.Load(dcidKey); ok {
+		debug.Printf(" findSession: found via direct lookup")
 		return val.(*handler.Context), dcid
 	}
 
 	// Alias lookup (server's SCID -> original DCID)
 	if originalKey, ok := p.dcidAliases.Load(dcidKey); ok {
+		debug.Printf(" findSession: found alias -> %x", originalKey.(string))
 		if val, ok := p.sessions.Load(originalKey.(string)); ok {
+			debug.Printf(" findSession: found session via alias")
 			return val.(*handler.Context), dcid
+		}
+		debug.Printf(" findSession: alias found but session not found")
+	} else {
+		debug.Printf(" findSession: no alias found for DCID")
+	}
+
+	// Fallback: lookup by client address
+	// This handles cases where client uses Connection IDs we don't know about
+	// (e.g., NEW_CONNECTION_ID issued by server in encrypted frames)
+	if clientAddr != nil {
+		clientKey := clientAddr.String()
+		if originalDCID, ok := p.clientSessions.Load(clientKey); ok {
+			debug.Printf(" findSession: trying client address fallback (%s)", clientKey)
+			if val, ok := p.sessions.Load(originalDCID.(string)); ok {
+				debug.Printf(" findSession: found session via client address")
+				return val.(*handler.Context), dcid
+			}
 		}
 	}
 
@@ -561,39 +612,41 @@ func (p *Proxy) registerDCIDLength(length int) {
 	p.dcidLengthsMu.Unlock()
 }
 
-// learnServerSCID extracts server's SCID from a Long Header response packet
-// and registers it as an alias for the original DCID.
+// learnServerSCID extracts server's SCID(s) from a Long Header response datagram
+// and registers them as aliases for the original DCID.
 // This enables routing subsequent client packets that use server's CID as DCID.
-func (p *Proxy) learnServerSCID(originalDCID string, ctx *handler.Context, packet []byte) {
-	// Only Long Header packets have SCID
-	pktType := ClassifyPacket(packet)
-	if pktType != PacketInitial && pktType != PacketHandshake {
-		return
+// Handles coalesced packets where Initial and Handshake may have different SCIDs.
+func (p *Proxy) learnServerSCID(originalDCID string, ctx *handler.Context, datagram []byte) {
+	// Debug: show both DCID and SCID in the packet
+	if dcid, scid, err := ExtractDCIDAndSCID(datagram); err == nil {
+		debug.Printf(" learnServerSCID: packet DCID=%x, SCID=%x (datagram %d bytes)", dcid, scid, len(datagram))
+		// Hex dump first 20 bytes for debugging
+		hexDump := datagram[:min(20, len(datagram))]
+		debug.Printf(" learnServerSCID: first 20 bytes: % x", hexDump)
 	}
 
-	scid, err := ExtractSCID(packet)
-	if err != nil || len(scid) == 0 {
-		return
+	// Extract all SCIDs from potentially coalesced packets
+	scids := ExtractAllSCIDs(datagram)
+
+	for _, scid := range scids {
+		scidKey := string(scid)
+		if scidKey == originalDCID {
+			continue // Same as original, no need for alias
+		}
+
+		// Check if we already have this alias (avoid duplicate logging)
+		if _, exists := p.dcidAliases.Load(scidKey); exists {
+			continue
+		}
+
+		// Store alias: server's SCID -> original DCID
+		p.dcidAliases.Store(scidKey, originalDCID)
+
+		// Track SCID length for Short Header parsing
+		p.registerDCIDLength(len(scid))
+
+		log.Printf("[proxy] learned server SCID=%x for session (original DCID=%s)", scid, originalDCID[:min(8, len(originalDCID))])
 	}
-
-	scidKey := string(scid)
-	if scidKey == originalDCID {
-		return // Same as original, no need for alias
-	}
-
-	// Store alias: server's SCID -> original DCID
-	p.dcidAliases.Store(scidKey, originalDCID)
-
-	// Track SCID length for Short Header parsing
-	p.registerDCIDLength(len(scid))
-
-	// Store server SCID in session for cleanup
-	if ctx.Session != nil {
-		ctx.Session.ServerSCID = make([]byte, len(scid))
-		copy(ctx.Session.ServerSCID, scid)
-	}
-
-	log.Printf("[proxy] learned server SCID=%x for session (original DCID=%s)", scid, originalDCID[:min(8, len(originalDCID))])
 }
 
 // Stop stops the proxy server gracefully.
@@ -696,16 +749,18 @@ func (p *Proxy) SessionCount() int {
 }
 
 // deleteSession removes a session and decrements the counter.
-// Also removes any DCID alias associated with the session.
+// Note: DCID aliases are cleaned up by timeout-based cleanup.
 func (p *Proxy) deleteSession(key string) {
-	if val, loaded := p.sessions.LoadAndDelete(key); loaded {
+	if _, loaded := p.sessions.LoadAndDelete(key); loaded {
 		p.sessionCount.Add(-1)
 
-		// Remove alias if session had a server SCID registered
-		ctx := val.(*handler.Context)
-		if ctx.Session != nil && len(ctx.Session.ServerSCID) > 0 {
-			p.dcidAliases.Delete(string(ctx.Session.ServerSCID))
-		}
+		// Clean up clientSessions mapping(s) that point to this session
+		p.clientSessions.Range(func(clientKey, dcidKey any) bool {
+			if dcidKey.(string) == key {
+				p.clientSessions.Delete(clientKey)
+			}
+			return true
+		})
 	}
 }
 
