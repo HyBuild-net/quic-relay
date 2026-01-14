@@ -71,7 +71,13 @@ func NewTerminatorHandler(raw json.RawMessage) (Handler, error) {
 
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{cert},
-		NextProtos:   []string{"quic-echo", "h3", "hq-interop"}, // Accept common protocols
+		// Accept any ALPN protocol the client offers
+		GetConfigForClient: func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
+			return &tls.Config{
+				Certificates: []tls.Certificate{cert},
+				NextProtos:   chi.SupportedProtos, // Mirror client's offered protocols
+			}, nil
+		},
 	}
 
 	// Start internal listener

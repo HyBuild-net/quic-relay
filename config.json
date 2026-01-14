@@ -6,7 +6,7 @@
       "type": "sni-router",
       "config": {
         "routes": {
-          "test.local": "127.0.0.1:4433"
+          "test.local": "hybuild.net:5521"
         }
       }
     },
