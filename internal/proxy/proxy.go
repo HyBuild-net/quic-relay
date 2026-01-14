@@ -21,8 +21,9 @@ import (
 
 // Config represents the proxy configuration.
 type Config struct {
-	Listen   string                  `json:"listen"`
-	Handlers []handler.HandlerConfig `json:"handlers"`
+	Listen         string                  `json:"listen"`
+	Handlers       []handler.HandlerConfig `json:"handlers"`
+	SessionTimeout int                     `json:"session_timeout,omitempty"` // Idle timeout in seconds (default: 600)
 }
 
 // LoadConfig loads configuration from a JSON file.
@@ -227,21 +228,24 @@ func (a *CryptoAssembler) GetCrypto() (cipher.Block, cipher.AEAD, []byte) {
 
 // Proxy is the main UDP proxy server.
 type Proxy struct {
-	listenAddr   string
-	conn         *net.UDPConn
-	chain        atomic.Pointer[handler.Chain] // Atomic for hot reload
-	sessions     sync.Map                      // DCID (string) -> *handler.Context
-	sessionCount atomic.Int64                  // O(1) session counter
-	assemblers   sync.Map                      // DCID (string) -> *CryptoAssembler
-	dcidAliases  sync.Map                      // Server SCID (string) -> original DCID (string)
-	workerPool   *WorkerPool
-	ctx          context.Context
-	cancel       context.CancelFunc
+	listenAddr     string
+	conn           *net.UDPConn
+	chain          atomic.Pointer[handler.Chain] // Atomic for hot reload
+	sessionTimeout atomic.Int64                  // Idle timeout in seconds (atomic for hot reload)
+	sessions       sync.Map                      // DCID (string) -> *handler.Context
+	sessionCount   atomic.Int64                  // O(1) session counter
+	assemblers     sync.Map                      // DCID (string) -> *CryptoAssembler
+	dcidAliases    sync.Map                      // Server SCID (string) -> original DCID (string)
+	workerPool     *WorkerPool
+	ctx            context.Context
+	cancel         context.CancelFunc
 
 	// DCID length tracking for Short Header parsing
 	dcidLengths   map[int]struct{}
 	dcidLengthsMu sync.RWMutex
 }
+
+const defaultSessionTimeout = 600 // 10 minutes in seconds
 
 // New creates a new proxy instance.
 func New(listenAddr string, chain *handler.Chain) *Proxy {
@@ -253,7 +257,17 @@ func New(listenAddr string, chain *handler.Chain) *Proxy {
 		cancel:      cancel,
 	}
 	p.chain.Store(chain)
+	p.sessionTimeout.Store(defaultSessionTimeout)
 	return p
+}
+
+// SetSessionTimeout updates the idle session timeout (atomic, hot-reload safe).
+// timeout is in seconds. If <= 0, uses default (600 seconds).
+func (p *Proxy) SetSessionTimeout(seconds int) {
+	if seconds <= 0 {
+		seconds = defaultSessionTimeout
+	}
+	p.sessionTimeout.Store(int64(seconds))
 }
 
 // ReloadChain atomically replaces the handler chain.
@@ -280,6 +294,7 @@ func (p *Proxy) Run() error {
 
 	log.Printf("[proxy] listening on %s", p.listenAddr)
 	log.Printf("[proxy] handler chain: %v", p.handlerNames())
+	log.Printf("[proxy] session timeout: %ds", p.sessionTimeout.Load())
 
 	// Start worker pool (bounded goroutines instead of unbounded per-packet)
 	// Note: workerPool.Stop() is called in Stop() for proper graceful shutdown
@@ -580,11 +595,11 @@ func (p *Proxy) cleanupSessions() {
 			return
 		case <-ticker.C:
 			// Cleanup idle sessions
+			timeout := time.Duration(p.sessionTimeout.Load()) * time.Second
 			p.sessions.Range(func(key, value any) bool {
 				ctx := value.(*handler.Context)
 				if ctx.Session != nil {
-					// Remove sessions idle for more than 10 minutes
-					if ctx.Session.IdleDuration() > 10*time.Minute {
+					if ctx.Session.IdleDuration() > timeout {
 						log.Printf("[proxy] cleaning up idle session: %s (idle %v)", key, ctx.Session.IdleDuration())
 						p.chain.Load().OnDisconnect(ctx)
 						p.deleteSession(key.(string))

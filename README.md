@@ -111,7 +111,21 @@ Logs the SNI of each connection. Useful for debugging.
 
 ## Advanced
 
-Environment variables as fallback when not set in config:
+### Global config options
+
+```json
+{
+  "listen": ":5520",
+  "session_timeout": 600,
+  "handlers": [...]
+}
+```
+
+- `session_timeout` - Idle session timeout in seconds (default: `600` = 10 minutes). Sessions without traffic are cleaned up after this duration. Can be changed via hot-reload (SIGHUP).
+
+### Environment variables
+
+Fallback when not set in config:
 - `QUIC_RELAY_LISTEN` - Listen address (default: `:5520`)
 - `QUIC_RELAY_BACKEND` - Backend address for `simple-router`
 

@@ -42,6 +42,7 @@ func main() {
 	}
 
 	p := proxy.New(cfg.Listen, chain)
+	p.SetSessionTimeout(cfg.SessionTimeout)
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
@@ -65,7 +66,8 @@ func main() {
 					continue
 				}
 				p.ReloadChain(newChain)
-				log.Printf("[proxy] config reloaded, handlers: %v", handlerNames(newChain))
+				p.SetSessionTimeout(newCfg.SessionTimeout)
+				log.Printf("[proxy] config reloaded, handlers: %v, session_timeout: %ds", handlerNames(newChain), newCfg.SessionTimeout)
 			case syscall.SIGINT, syscall.SIGTERM:
 				log.Println("[proxy] shutting down...")
 				p.Stop()
