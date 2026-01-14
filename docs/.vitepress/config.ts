@@ -8,7 +8,8 @@ export default defineConfig({
   cleanUrls: true,
 
   head: [
-    ['link', { rel: 'icon', href: '/quic-relay/favicon.ico' }]
+    ['link', { rel: 'icon', href: '/quic-relay/favicon.ico' }],
+    ['meta', { name: 'google-site-verification', content: '-T2K0pWwX_CIpTMvP-RrEmr0nCenG4Nhw1YIl5NcjDQ' }]
   ],
 
   themeConfig: {
