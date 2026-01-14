@@ -4,3 +4,7 @@ CONSTITUTION.md
 *.pem
 *.key
 *.crt
+
+# Binaries
+hyproxy
+quic-relay
