@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -296,14 +295,12 @@ func (h *TerminatorHandler) Shutdown(ctx context.Context) error {
 
 // terminatorSession represents a bridged connection between client and server.
 type terminatorSession struct {
-	clientConn    *quic.Conn
-	serverConn    *quic.Conn
-	ctx           context.Context
-	cancel        context.CancelFunc
-	closed        atomic.Bool
-	wg            sync.WaitGroup
-	clientPackets atomic.Int32 // Counter for logged client packets
-	serverPackets atomic.Int32 // Counter for logged server packets
+	clientConn *quic.Conn
+	serverConn *quic.Conn
+	ctx        context.Context
+	cancel     context.CancelFunc
+	closed     atomic.Bool
+	wg         sync.WaitGroup
 
 	// Per-direction logging config
 	logClientPackets  int
@@ -313,245 +310,58 @@ type terminatorSession struct {
 	maxPacketSize     int
 }
 
-// streamLogger buffers stream data to handle packet fragmentation.
-type streamLogger struct {
-	prefix        string
-	counter       *atomic.Int32
-	buffer        []byte
-	packets       int
-	maxPackets    int
-	skipPackets   int
-	skipped       int
-	maxPacketSize int // Skip packets larger than this
+// chunkLogger logs stream chunks without packet reconstruction.
+type chunkLogger struct {
+	prefix  string
+	logged  int
+	maxLog  int
+	skip    int
+	maxSize int
 }
 
-func newStreamLogger(prefix string, counter *atomic.Int32, maxPackets, skipPackets, maxPacketSize int) *streamLogger {
-	return &streamLogger{
-		prefix:        prefix,
-		counter:       counter,
-		maxPackets:    maxPackets,
-		skipPackets:   skipPackets,
-		maxPacketSize: maxPacketSize,
+func (l *chunkLogger) log(data []byte) {
+	// Check limits
+	if l.logged >= l.maxLog {
+		return
 	}
+	if l.maxSize > 0 && len(data) > l.maxSize {
+		return
+	}
+	if l.skip > 0 {
+		l.skip--
+		return
+	}
+
+	l.logged++
+	l.logChunk(data)
 }
 
-// processData adds data to buffer and tries to log complete packets.
-func (l *streamLogger) processData(data []byte) {
-	if l.maxPackets <= 0 || l.packets >= l.maxPackets {
-		return // Logging disabled or limit reached
-	}
-
-	l.buffer = append(l.buffer, data...)
-	l.tryLogPackets()
-}
-
-// tryLogPackets attempts to extract and log complete packets from the buffer.
-func (l *streamLogger) tryLogPackets() {
-	for l.packets < l.maxPackets && len(l.buffer) > 0 {
-		// Determine if we should log this packet or just skip it
-		shouldLog := l.skipped >= l.skipPackets
-
-		consumed := l.tryConsumePacket(shouldLog)
-		if consumed == 0 {
-			break // Need more data
-		}
-		l.buffer = l.buffer[consumed:]
-
-		// Skip packets before logging
-		if l.skipped < l.skipPackets {
-			l.skipped++
-			continue
-		}
-
-		l.packets++
-		l.counter.Add(1)
-	}
-}
-
-const maxZstdDecodeSize = 2 * 1024 * 1024 // 2MB max for zstd decode attempts
-
-// tryConsumePacket finds a complete packet and optionally logs it.
-// Returns bytes consumed, or 0 if incomplete.
-func (l *streamLogger) tryConsumePacket(shouldLog bool) int {
-	if len(l.buffer) < 8 {
-		return 0 // Need at least header
-	}
-
-	// Look for zstd magic anywhere in the buffer
-	idx := bytes.Index(l.buffer, zstdMagic)
-	if idx >= 0 {
-		compressed := l.buffer[idx:]
-
-		// If buffer exceeds max packet size, silently skip in chunks
-		if l.maxPacketSize > 0 && len(l.buffer) > l.maxPacketSize {
-			consumeLen := 64 * 1024 // 64KB chunks
-			if consumeLen > len(l.buffer) {
-				consumeLen = len(l.buffer)
-			}
-			// Don't log, don't count - just silently consume
-			return consumeLen
-		}
-
-		// If buffer is too large for decode, skip in chunks
-		if len(l.buffer) > maxZstdDecodeSize {
-			consumeLen := 64 * 1024
-			if consumeLen > len(l.buffer) {
-				consumeLen = len(l.buffer)
-			}
-			return consumeLen
-		}
-
-		// Try to find complete zstd frame
-		frameSize := getZstdFrameSizeFast(compressed)
-		if frameSize == 0 {
-			return 0 // Need more data
-		}
-
-		// Complete frame found - check size limit before logging
-		totalLen := idx + frameSize
-		if l.maxPacketSize > 0 && totalLen > l.maxPacketSize {
-			// Silently skip large packet
-			return totalLen
-		}
-		if shouldLog {
-			logPacketComplete(l.prefix, l.packets+1, l.buffer[:totalLen], idx, frameSize)
-		}
-		return totalLen
-	}
-
-	// No zstd magic found
-
-	// Check if buffer looks like it might be waiting for zstd
-	if len(l.buffer) >= 4096 {
-		if shouldLog {
-			logPacket(l.prefix, l.packets+1, l.buffer[:4096])
-		}
-		return 4096
-	}
-
-	// Try to determine packet boundary
-	pktLen := l.findPacketBoundary()
-	if pktLen > 0 && pktLen <= len(l.buffer) {
-		if shouldLog {
-			logPacket(l.prefix, l.packets+1, l.buffer[:pktLen])
-		}
-		return pktLen
-	}
-
-	// If buffer is reasonably sized, consume it
-	if len(l.buffer) >= 64 && len(l.buffer) < 1024 {
-		if shouldLog {
-			logPacket(l.prefix, l.packets+1, l.buffer)
-		}
-		return len(l.buffer)
-	}
-
-	return 0 // Need more data
-}
-
-// findPacketBoundary tries to find where the current packet ends.
-func (l *streamLogger) findPacketBoundary() int {
-	// Look for patterns that suggest packet boundaries
-	// The protocol seems to have 8-byte headers with small type values
-
-	// Scan for potential next packet header
-	for i := 8; i+8 <= len(l.buffer); i++ {
-		// Check if this looks like a header (small first uint32, reasonable second)
-		val1 := binary.LittleEndian.Uint32(l.buffer[i:])
-		val2 := binary.LittleEndian.Uint32(l.buffer[i+4:])
-
-		// Header heuristics: type < 256, second value < 64KB
-		if val1 < 256 && val2 < 65536 && val2 > 0 {
-			return i
-		}
-	}
-
-	return 0
-}
-
-// getZstdFrameSizeFast returns the total frame size, or 0 if incomplete.
-// Uses exponential search then binary search for efficiency on large data.
-func getZstdFrameSizeFast(data []byte) int {
-	if len(data) < 5 {
-		return 0
-	}
-
-	// First, quick check if we have a complete frame at all
-	if _, err := zstdDecoder.DecodeAll(data, nil); err != nil {
-		return 0 // Frame incomplete
-	}
-
-	// Exponential search to find approximate size
-	size := 5
-	for size < len(data) {
-		if _, err := zstdDecoder.DecodeAll(data[:size], nil); err == nil {
-			break // Found a working size
-		}
-		if size < 1024 {
-			size += 64 // Small steps for small frames
-		} else if size < 64*1024 {
-			size += 1024 // 1KB steps for medium frames
-		} else {
-			size += 8192 // 8KB steps for large frames
-		}
-	}
-
-	if size > len(data) {
-		size = len(data)
-	}
-
-	// Binary search to find exact minimum size
-	lo, hi := 5, size
-	result := size
-
-	for lo <= hi {
-		mid := (lo + hi) / 2
-		if _, err := zstdDecoder.DecodeAll(data[:mid], nil); err == nil {
-			result = mid
-			hi = mid - 1
-		} else {
-			lo = mid + 1
-		}
-	}
-
-	return result
-}
-
-const maxHexDumpSize = 4096 // Max bytes to hex dump
-
-// logPacketComplete logs a packet with successful zstd decode.
-func logPacketComplete(prefix string, num int, data []byte, zstdIdx, frameSize int) {
+func (l *chunkLogger) logChunk(data []byte) {
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("%s packet #%d (%d bytes)\n", prefix, num, len(data)))
+	sb.WriteString(fmt.Sprintf("%s chunk #%d (%d bytes)\n", l.prefix, l.logged, len(data)))
 
-	if zstdIdx > 0 {
-		sb.WriteString(fmt.Sprintf("── Header (%d bytes) ──\n", zstdIdx))
-		sb.WriteString(formatHeader(data[:zstdIdx]))
-	}
-
-	compressed := data[zstdIdx : zstdIdx+frameSize]
-	if decompressed, err := zstdDecoder.DecodeAll(compressed, nil); err == nil {
-		sb.WriteString(fmt.Sprintf("── Payload (zstd: %d → %d bytes, ratio %.1fx) ──\n",
-			len(compressed), len(decompressed), float64(len(decompressed))/float64(len(compressed))))
-
-		// Truncate very large payloads
-		if len(decompressed) > maxHexDumpSize {
-			sb.WriteString(hexDump(decompressed[:maxHexDumpSize]))
-			sb.WriteString(fmt.Sprintf("... (%d more bytes truncated)\n", len(decompressed)-maxHexDumpSize))
-		} else {
-			sb.WriteString(hexDump(decompressed))
-		}
-	} else {
-		sb.WriteString(fmt.Sprintf("── Payload (zstd decode failed: %v) ──\n", err))
-		if len(compressed) > maxHexDumpSize {
-			sb.WriteString(hexDump(compressed[:maxHexDumpSize]))
-			sb.WriteString(fmt.Sprintf("... (%d more bytes truncated)\n", len(compressed)-maxHexDumpSize))
-		} else {
-			sb.WriteString(hexDump(compressed))
+	// Try zstd decode if magic at start
+	if bytes.HasPrefix(data, zstdMagic) {
+		if decoded, err := zstdDecoder.DecodeAll(data, nil); err == nil {
+			sb.WriteString(fmt.Sprintf("── zstd: %d → %d bytes ──\n", len(data), len(decoded)))
+			sb.WriteString(hexDumpLimit(decoded, maxHexDumpSize))
+			log.Print(sb.String())
+			return
 		}
 	}
 
+	sb.WriteString(hexDumpLimit(data, maxHexDumpSize))
 	log.Print(sb.String())
+}
+
+const maxHexDumpSize = 4096
+
+// hexDumpLimit formats bytes as hex + ASCII with a size limit.
+func hexDumpLimit(data []byte, maxLen int) string {
+	if len(data) > maxLen {
+		return hexDump(data[:maxLen]) + fmt.Sprintf("... (%d more bytes)\n", len(data)-maxLen)
+	}
+	return hexDump(data)
 }
 
 func newTerminatorSession(client, server *quic.Conn, cfg *TerminatorConfig) *terminatorSession {
@@ -701,45 +511,42 @@ var zstdMagic = []byte{0x28, 0xB5, 0x2F, 0xFD}
 // Shared zstd decoder (thread-safe, reusable)
 var zstdDecoder, _ = zstd.NewReader(nil)
 
-// copyWithLog copies data from src to dst while logging packets per direction.
+// copyWithLog copies data from src to dst while logging chunks per direction.
 func (s *terminatorSession) copyWithLog(dst io.Writer, src io.Reader, prefix string) (int64, error) {
 	// Fast path: debug mode disabled, just copy
 	if !debug.IsEnabled() {
 		return io.Copy(dst, src)
 	}
 
-	var maxPackets, skipPackets int
-
+	var maxLog, skip int
 	if prefix == "[client]" {
-		maxPackets = s.logClientPackets
-		skipPackets = s.skipClientPackets
+		maxLog = s.logClientPackets
+		skip = s.skipClientPackets
 	} else {
-		maxPackets = s.logServerPackets
-		skipPackets = s.skipServerPackets
+		maxLog = s.logServerPackets
+		skip = s.skipServerPackets
 	}
 
 	// No logging configured for this direction
-	if maxPackets <= 0 {
+	if maxLog <= 0 {
 		return io.Copy(dst, src)
 	}
 
-	// Logging enabled - use buffered logger
-	buf := make([]byte, 32*1024)
-	var total int64
-
-	var counter *atomic.Int32
-	if prefix == "[client]" {
-		counter = &s.clientPackets
-	} else {
-		counter = &s.serverPackets
+	// Logging enabled - use chunk logger
+	logger := &chunkLogger{
+		prefix:  prefix,
+		maxLog:  maxLog,
+		skip:    skip,
+		maxSize: s.maxPacketSize,
 	}
 
-	logger := newStreamLogger(prefix, counter, maxPackets, skipPackets, s.maxPacketSize)
+	buf := make([]byte, 32*1024)
+	var total int64
 
 	for {
 		n, err := src.Read(buf)
 		if n > 0 {
-			logger.processData(buf[:n])
+			logger.log(buf[:n])
 			nw, werr := dst.Write(buf[:n])
 			total += int64(nw)
 			if werr != nil {
@@ -753,50 +560,6 @@ func (s *terminatorSession) copyWithLog(dst io.Writer, src io.Reader, prefix str
 			return total, err
 		}
 	}
-}
-
-// logPacket analyzes and logs a packet, decompressing zstd if found.
-func logPacket(prefix string, num int, data []byte) {
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("%s packet #%d (%d bytes)\n", prefix, num, len(data)))
-
-	// Find zstd magic in packet
-	if idx := bytes.Index(data, zstdMagic); idx >= 0 && idx < 32 {
-		// Header before zstd
-		if idx > 0 {
-			sb.WriteString(fmt.Sprintf("── Header (%d bytes) ──\n", idx))
-			sb.WriteString(formatHeader(data[:idx]))
-		}
-
-		// Decompress zstd payload
-		compressed := data[idx:]
-		if decompressed, err := zstdDecoder.DecodeAll(compressed, nil); err == nil {
-			sb.WriteString(fmt.Sprintf("── Payload (zstd: %d → %d bytes) ──\n", len(compressed), len(decompressed)))
-			sb.WriteString(hexDump(decompressed))
-		} else {
-			sb.WriteString(fmt.Sprintf("── Payload (zstd decode failed: %v) ──\n", err))
-			sb.WriteString(hexDump(compressed))
-		}
-	} else {
-		// No zstd, dump raw
-		sb.WriteString(hexDump(data))
-	}
-
-	log.Print(sb.String())
-}
-
-// formatHeader formats the packet header as labeled uint32 fields.
-func formatHeader(data []byte) string {
-	var sb strings.Builder
-	for i := 0; i+4 <= len(data); i += 4 {
-		val := binary.LittleEndian.Uint32(data[i:])
-		sb.WriteString(fmt.Sprintf("  [%d] 0x%08x (%d)\n", i/4, val, val))
-	}
-	// Trailing bytes
-	if rem := len(data) % 4; rem > 0 {
-		sb.WriteString(fmt.Sprintf("  ... %x\n", data[len(data)-rem:]))
-	}
-	return sb.String()
 }
 
 // hexDump formats bytes as hex + ASCII.
