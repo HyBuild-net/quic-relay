@@ -111,6 +111,9 @@ func (h *TerminatorHandler) OnConnect(ctx *Context) Result {
 		return Result{Action: Drop, Error: errors.New("no DCID in packet")}
 	}
 
+	// Store DCID in context for cleanup in OnDisconnect
+	ctx.Set("terminator_dcid", dcid)
+
 	// Register backend for this DCID
 	h.term.RegisterBackend(dcid, backend)
 
@@ -136,12 +139,10 @@ func (h *TerminatorHandler) OnPacket(ctx *Context, packet []byte, dir Direction)
 
 // OnDisconnect cleans up backend mapping if connection didn't reach terminator.
 func (h *TerminatorHandler) OnDisconnect(ctx *Context) {
-	// Clean up in case connection was dropped before terminator processed it
-	if ctx.InitialPacket != nil {
-		dcid := terminator.ParseQUICDCID(ctx.InitialPacket)
-		if dcid != "" {
-			h.term.UnregisterBackend(dcid)
-		}
+	// Clean up using DCID stored in context (InitialPacket may be nil at this point)
+	dcid := ctx.GetString("terminator_dcid")
+	if dcid != "" {
+		h.term.UnregisterBackend(dcid)
 	}
 }
 
