@@ -143,7 +143,7 @@ Requires clients to use the [HytaleCustomCert](https://hybuildnet.github.io/Hyta
         "key": "/etc/quic-relay/server.key"
       },
       "targets": {
-        "10.0.0.1:25565": {
+        "10.0.0.1:5521": {
           "cert": "/etc/quic-relay/backend1.crt",
           "key": "/etc/quic-relay/backend1.key",
           "backend_mtls": true

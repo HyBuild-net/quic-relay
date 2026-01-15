@@ -126,7 +126,7 @@ Terminates QUIC TLS and bridges to backend servers. This allows inspection of ra
 {
   "listen": ":5520",
   "handlers": [
-    {"type": "sni-router", "config": {"routes": {"play.example.com": "10.0.0.1:25565"}}},
+    {"type": "sni-router", "config": {"routes": {"play.example.com": "10.0.0.1:5521"}}},
     {
       "type": "terminator",
       "config": {
@@ -137,7 +137,7 @@ Terminates QUIC TLS and bridges to backend servers. This allows inspection of ra
             "key": "/etc/quic-relay/server.key"
           },
           "targets": {
-            "10.0.0.1:25565": {
+            "10.0.0.1:5521": {
               "cert": "/etc/quic-relay/backend1.crt",
               "key": "/etc/quic-relay/backend1.key",
               "backend_mtls": true
