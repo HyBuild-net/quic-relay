@@ -13,12 +13,25 @@ func init() {
 	Register("terminator", NewTerminatorHandler)
 }
 
-// TerminatorHandlerConfig holds configuration for the terminator handler.
-type TerminatorHandlerConfig struct {
-	Listen      string `json:"listen"`       // ":5521" or "auto" for ephemeral port
+// TerminatorCertConfig holds TLS config for a certificate.
+type TerminatorCertConfig struct {
 	Cert        string `json:"cert"`         // Path to TLS certificate
 	Key         string `json:"key"`          // Path to TLS private key
-	BackendMTLS bool   `json:"backend_mtls"` // Use same cert as client cert for backend mTLS
+	BackendMTLS bool   `json:"backend_mtls"` // Use cert as client cert for backend mTLS
+}
+
+// TerminatorCertsConfig groups all certificate configurations.
+type TerminatorCertsConfig struct {
+	Default *TerminatorCertConfig            `json:"default"` // Fallback certificate
+	Targets map[string]*TerminatorCertConfig `json:"targets"` // Backend address → cert config
+}
+
+// TerminatorHandlerConfig holds configuration for the terminator handler.
+type TerminatorHandlerConfig struct {
+	Listen string `json:"listen"` // ":5521" or "auto" for ephemeral port
+
+	// Certificate configurations
+	Certs *TerminatorCertsConfig `json:"certs"`
 
 	// Packet logging settings (per direction)
 	LogClientPackets  int `json:"log_client_packets"`  // Number of client packets to log (0 = disabled)
@@ -40,17 +53,39 @@ func NewTerminatorHandler(raw json.RawMessage) (Handler, error) {
 		return nil, err
 	}
 
-	term, err := terminator.New(terminator.Config{
+	// Convert handler config to terminator config
+	termCfg := terminator.Config{
 		Listen:           cfg.Listen,
-		CertFile:         cfg.Cert,
-		KeyFile:          cfg.Key,
-		BackendMTLS:      cfg.BackendMTLS,
 		LogClientChunks:  cfg.LogClientPackets,
 		LogServerChunks:  cfg.LogServerPackets,
 		SkipClientChunks: cfg.SkipClientPackets,
 		SkipServerChunks: cfg.SkipServerPackets,
 		MaxChunkSize:     cfg.MaxPacketSize,
-	})
+	}
+
+	// Convert certificate configs
+	if cfg.Certs != nil {
+		if cfg.Certs.Default != nil {
+			termCfg.Default = &terminator.TargetConfig{
+				CertFile:    cfg.Certs.Default.Cert,
+				KeyFile:     cfg.Certs.Default.Key,
+				BackendMTLS: cfg.Certs.Default.BackendMTLS,
+			}
+		}
+
+		if len(cfg.Certs.Targets) > 0 {
+			termCfg.Targets = make(map[string]*terminator.TargetConfig)
+			for target, tcfg := range cfg.Certs.Targets {
+				termCfg.Targets[target] = &terminator.TargetConfig{
+					CertFile:    tcfg.Cert,
+					KeyFile:     tcfg.Key,
+					BackendMTLS: tcfg.BackendMTLS,
+				}
+			}
+		}
+	}
+
+	term, err := terminator.New(termCfg)
 	if err != nil {
 		return nil, err
 	}

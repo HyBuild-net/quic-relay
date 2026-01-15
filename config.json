@@ -14,9 +14,13 @@
       "type": "terminator",
       "config": {
         "listen": ":5522",
-        "cert": "server.crt",
-        "key": "server.key",
-        "backend_mtls": true,
+        "certs": {
+          "default": {
+            "cert": "server.crt",
+            "key": "server.key",
+            "backend_mtls": true
+          }
+        },
         "log_client_packets": 0,
         "log_server_packets": 50,
         "skip_client_packets": 5,
