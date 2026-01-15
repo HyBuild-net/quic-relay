@@ -329,7 +329,14 @@ func (l *streamLogger) processData(data []byte) {
 	}
 
 	l.buffer = append(l.buffer, data...)
+	beforeLen := len(l.buffer)
 	l.tryLogPackets()
+
+	// Debug: log if buffer is stuck
+	if len(l.buffer) > 1024 && len(l.buffer) == beforeLen && l.packets == 0 && l.skipped < l.skipPackets {
+		log.Printf("%s DEBUG: buffer stuck at %d bytes, skipped=%d, has zstd=%v",
+			l.prefix, len(l.buffer), l.skipped, bytes.Contains(l.buffer[:min(len(l.buffer), 256)], zstdMagic))
+	}
 }
 
 // tryLogPackets attempts to extract and log complete packets from the buffer.
@@ -355,6 +362,8 @@ func (l *streamLogger) tryLogPackets() {
 	}
 }
 
+const maxZstdDecodeSize = 64 * 1024 // 64KB max for zstd decode attempts
+
 // tryConsumePacket finds a complete packet and optionally logs it.
 // Returns bytes consumed, or 0 if incomplete.
 func (l *streamLogger) tryConsumePacket(shouldLog bool) int {
@@ -365,8 +374,23 @@ func (l *streamLogger) tryConsumePacket(shouldLog bool) int {
 	// Look for zstd magic anywhere in the buffer
 	idx := bytes.Index(l.buffer, zstdMagic)
 	if idx >= 0 {
-		// Found zstd, try to decode
 		compressed := l.buffer[idx:]
+
+		// If buffer is too large, skip zstd decode and just consume a chunk
+		if len(l.buffer) > maxZstdDecodeSize {
+			// Large packet - log header + raw summary
+			consumeLen := 4096
+			if consumeLen > len(l.buffer) {
+				consumeLen = len(l.buffer)
+			}
+			if shouldLog {
+				log.Printf("%s packet #%d (large zstd, %d bytes buffered, consuming %d)\n",
+					l.prefix, l.packets+1, len(l.buffer), consumeLen)
+			}
+			return consumeLen
+		}
+
+		// Try to decode (only for reasonable sizes)
 		frameSize := getZstdFrameSize(compressed)
 		if frameSize == 0 {
 			return 0 // Need more data
