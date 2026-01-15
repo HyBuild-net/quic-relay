@@ -1,6 +1,7 @@
 FROM golang:1.25-alpine AS builder
 WORKDIR /app
 COPY go.mod go.sum ./
+COPY pkg/terminator/go.mod pkg/terminator/go.sum ./pkg/terminator/
 RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -o quic-relay ./cmd/proxy
