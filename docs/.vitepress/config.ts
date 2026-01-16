@@ -17,11 +17,7 @@ export default defineConfig({
   ],
 
   themeConfig: {
-    logo: {
-      src: '/logo.png',
-      width: 140,
-      height: 140
-    },
+    logo: '/logo.png',
     siteTitle: false,
 
     nav: [
