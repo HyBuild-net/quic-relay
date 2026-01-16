@@ -42,14 +42,16 @@ Or mount your config:
 docker run -p 5520:5520/udp -v /path/to/config.json:/data/config.json ghcr.io/hybuildnet/quic-relay:latest
 ```
 
+> **Note:** If your backend servers are on an internal network, ensure the container has network access (e.g., `--network host` or connect to the appropriate Docker network).
+
 ## Handlers
 
 Handlers form a chain. Each handler processes the connection and either passes it to the next handler (`Continue`), handles it (`Handled`), or drops it (`Drop`).
 Custom handlers can be implemented quite easily, but the project needs to be recompiled.
 
-### sni-router
+### SNI Router (Domain-based Routing)
 
-Routes connections to different backends based on SNI. Each route can be a single backend or multiple backends (array) for round-robin load balancing. Connections with unknown SNI are dropped.
+Routes connections based on the domain (SNI) players connect to.
 
 ```json
 {
@@ -60,48 +62,56 @@ Routes connections to different backends based on SNI. Each route can be a singl
       "config": {
         "routes": {
           "play.example.com": "10.0.0.1:5520",
-          "lobby.example.com": ["10.0.0.2:5520", "[2001:db8::1]:5520"],
-          "minigames.example.com": "myserver.internal.dev:5520"
+          "lobby.example.com": "10.0.0.2:5521",
+          "minigames.example.com": "myserver.internal.dev:8000"
         }
       }
     },
-    {"type": "forwarder"}
+    {
+      "type": "forwarder"
+    }
   ]
 }
 ```
-[?] Why do we need the `{"type": "forwarder"}` here? The forwarding logic is implemented as a handler itself, this way we can easily replace the forwarding logic with some kind of terminating-logic, which can read the Hytale-Protocol itself and is capable to dig deeper into the game logic rather than just proxy traffic through.
 
-> **Edit:** Termination is possible using the [terminator](#terminator) handler with custom certificates. Clients need the [HytaleCustomCert](https://hybuildnet.github.io/HytaleCustomCert/) plugin to disable certificate binding validation.
+> **Note:** The `forwarder` handler contains the actual forwarding logic. This separation allows replacing it with a [terminating proxy](#tls-termination) for protocol inspection.
 
-### simple-router
+### Simple Router
 
-Routes all connections to one or more backends. Use `backend` for a single destination or `backends` for round-robin load balancing.
+Routes all connections to a single backend.
 
 ```json
 {
   "listen": ":5520",
   "handlers": [
-    {"type": "ratelimit-global", "config": {"max_parallel_connections": 10000}},
+    {
+      "type": "ratelimit-global",
+      "config": {
+        "max_parallel_connections": 10000
+      }
+    },
     {
       "type": "simple-router",
       "config": {
-        "backends": ["10.0.0.1:5520", "10.0.0.2:5520", "[2001:db8::1]:5520"]
+        "backend": "10.0.0.1:5527"
       }
     },
-    {"type": "forwarder"}
+    {
+      "type": "forwarder"
+    }
   ]
 }
 ```
 
-### ratelimit-global
+### Rate Limiter
 
 Limits the total number of concurrent connections. New connections are dropped when the limit is reached.
 
-### forwarder
+### Forwarder
 
 Forwards packets to the backend. Must be the last handler in the chain.
 
-### logsni
+### Log SNI
 
 Logs the SNI of each connection. Useful for debugging.
 
@@ -109,24 +119,62 @@ Logs the SNI of each connection. Useful for debugging.
 {
   "listen": ":5520",
   "handlers": [
-    {"type": "logsni"},
-    {"type": "sni-router", "config": {"routes": {"play.example.com": "10.0.0.1:5520"}}},
-    {"type": "forwarder"}
+    {
+      "type": "logsni"
+    },
+    {
+      "type": "sni-router",
+      "config": {
+        "routes": {
+          "play.example.com": "10.0.0.1:5521"
+        }
+      }
+    },
+    {
+      "type": "forwarder"
+    }
   ]
 }
 ```
 
-### terminator
+## Advanced
 
-Terminates QUIC TLS and bridges to backend servers. This allows inspection of raw `hytale/1` protocol traffic. Must be placed before the `forwarder` handler. Supports target-based certificates and mTLS.
+### Load Balancing
 
-[!] Requires clients to use the [HytaleCustomCert](https://hybuildnet.github.io/HytaleCustomCert/) plugin to disable certificate binding validation.
+Both `sni-router` and `simple-router` support round-robin load balancing. Use an array of backends instead of a single address:
+
+```json
+{
+  "type": "sni-router",
+  "config": {
+    "routes": {
+      "play.example.com": ["10.0.0.1:5520", "10.0.0.2:5520", "[2001:db8::1]:5520"]
+    }
+  }
+}
+```
+
+For `simple-router`, use `backends` (array) instead of `backend` (string).
+
+### TLS Termination
+
+The `terminator` handler terminates QUIC TLS and bridges to backend servers. This allows inspection of raw `hytale/1` protocol traffic. Supports per-target certificates for different backends.
+
+> **Note:** Requires the [HytaleCustomCert](https://hybuildnet.github.io/HytaleCustomCert/) plugin on backend servers with `bypassClientCertificateBinding: true`. This allows the proxy to use the same certificate as the backend server.
 
 ```json
 {
   "listen": ":5520",
   "handlers": [
-    {"type": "sni-router", "config": {"routes": {"play.example.com": "10.0.0.1:5521"}}},
+    {
+      "type": "sni-router",
+      "config": {
+        "routes": {
+          "play.example.com": "10.0.0.1:5521",
+          "dev.example.com": "10.0.0.2:5522"
+        }
+      }
+    },
     {
       "type": "terminator",
       "config": {
@@ -137,27 +185,26 @@ Terminates QUIC TLS and bridges to backend servers. This allows inspection of ra
             "key": "/etc/quic-relay/server.key"
           },
           "targets": {
-            "10.0.0.1:5521": {
-              "cert": "/etc/quic-relay/backend1.crt",
-              "key": "/etc/quic-relay/backend1.key",
-              "backend_mtls": true
+            "10.0.0.2:5522": {
+              "cert": "/etc/quic-relay/dev.crt",
+              "key": "/etc/quic-relay/dev.key"
             }
           }
-        },
-        "log_client_packets": 5,
-        "log_server_packets": 5
+        }
       }
     },
-    {"type": "forwarder"}
+    {
+      "type": "forwarder"
+    }
   ]
 }
 ```
 
-See [pkg/terminator](https://github.com/HyBuildNet/hytale-terminating-proxy) for standalone library usage.
+Backend mTLS is enabled by default. Set `"backend_mtls": false` on a target or default to disable.
 
-## Advanced
+See [hytale-terminating-proxy](https://github.com/HyBuildNet/hytale-terminating-proxy) for standalone library usage.
 
-### Global config options
+### Global Config Options
 
 ```json
 {
@@ -169,7 +216,7 @@ See [pkg/terminator](https://github.com/HyBuildNet/hytale-terminating-proxy) for
 
 - `session_timeout` - Idle session timeout in seconds (default: `600` = 10 minutes). Sessions without traffic are cleaned up after this duration. Can be changed via hot-reload (SIGHUP).
 
-### Environment variables
+### Environment Variables
 
 Fallback when not set in config:
 - `QUIC_RELAY_LISTEN` - Listen address (default: `:5520`)
@@ -187,4 +234,4 @@ Produces `bin/proxy`.
 
 MIT License. See [LICENSE](LICENSE) for details.
 
-[!] This project is neither related to nor affiliated with HYPIXEL STUDIOS CANADA INC. or any other Trademark owner of Hytale.
+*This project is neither related to nor affiliated with HYPIXEL STUDIOS CANADA INC. or any other Trademark owner of Hytale.*
