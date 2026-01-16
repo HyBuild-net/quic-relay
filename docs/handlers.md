@@ -145,7 +145,8 @@ Requires clients to use the [HytaleCustomCert](https://hybuildnet.github.io/Hyta
       "targets": {
         "10.0.0.1:5521": {
           "cert": "/etc/quic-relay/backend1.crt",
-          "key": "/etc/quic-relay/backend1.key"
+          "key": "/etc/quic-relay/backend1.key",
+          "backend_mtls": true
         }
       }
     },
@@ -174,7 +175,7 @@ Requires clients to use the [HytaleCustomCert](https://hybuildnet.github.io/Hyta
 |-------|-------------|
 | `cert` | Path to TLS certificate |
 | `key` | Path to TLS private key |
-| `backend_mtls` | Use certificate as client cert for backend mTLS (default: `true`) |
+| `backend_mtls` | Use certificate as client cert for backend mTLS |
 
 **Behavior:**
 - Extracts DCID from initial packet and registers backend mapping
