@@ -80,18 +80,74 @@ Different backends can use different certificates:
 | `key` | Path to TLS private key |
 | `backend_mtls` | Use certificate for backend mTLS (default: `true`) |
 
-### Packet logging
+### Debug mode
 
-For debugging protocol traffic:
+Enable protocol-level packet logging:
 
 | Field | Description |
 |-------|-------------|
-| `log_client_packets` | Number of client packets to log (0 = disabled) |
-| `log_server_packets` | Number of server packets to log (0 = disabled) |
-| `skip_client_packets` | Skip first N packets before logging |
-| `skip_server_packets` | Skip first N packets before logging |
-| `max_packet_size` | Skip packets larger than this (default: 1MB) |
+| `debug` | Enable packet parsing and logging (`true`/`false`) |
+| `debug_packet_limit` | Max packets to log per stream (0 = unlimited) |
+
+Example:
+
+```json
+{
+  "type": "terminator",
+  "config": {
+    "listen": "auto",
+    "certs": {
+      "default": {
+        "cert": "server.crt",
+        "key": "server.key"
+      }
+    },
+    "debug": true,
+    "debug_packet_limit": 100
+  }
+}
+```
+
+When enabled, logs Hytale protocol packets:
+
+```
+[packet] (C->S) Connect (0x00000001) 128 bytes
+[packet] (C->S)   user=PlayerName uuid=12345678-...
+[packet] (S->C) 0x00000002 64 bytes
+```
+
+## Packet handlers (programmatic)
+
+For advanced use cases, packet handlers can be registered programmatically to inspect, filter, or modify decrypted packets:
+
+```go
+termHandler := findTerminatorHandler(chain)
+
+termHandler.AddPacketHandler(func(dcid string, pkt *protohytale.Packet, fromClient bool) ([]byte, terminator.PacketAction) {
+    // Log all packets
+    log.Printf("[%s] 0x%08X %d bytes", dcid[:8], pkt.ID, len(pkt.Data))
+
+    // Drop specific packets
+    if pkt.ID == 0xDEADBEEF {
+        return nil, terminator.PacketDrop
+    }
+
+    // Modify packet data
+    if pkt.ID == 0x1234 {
+        modified := transform(pkt.Data)
+        return modified, terminator.PacketContinue
+    }
+
+    // Pass through unchanged
+    return nil, terminator.PacketContinue
+})
+```
+
+Handlers are executed in order of registration. Each handler can:
+- **Inspect** packets (logging, metrics)
+- **Drop** packets (filtering)
+- **Modify** packet data (transformation)
 
 ## Standalone library
 
-The terminator is available as a standalone Go library: [hytale-terminating-proxy](https://github.com/HyBuildNet/hytale-terminating-proxy)
+The terminator is available as a standalone Go library in `pkg/terminator`.

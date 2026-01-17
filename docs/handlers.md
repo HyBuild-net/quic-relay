@@ -146,9 +146,34 @@ Useful for debugging or monitoring which hostnames clients connect to.
 
 ### terminator
 
-Terminates QUIC TLS and bridges to backend servers. Must be placed before `forwarder`.
+Terminates QUIC TLS and bridges to backend servers. Enables inspection of decrypted Hytale protocol traffic. Must be placed before `forwarder`.
 
-See [TLS Termination](./tls-termination.md) for configuration and usage.
+```json
+{
+  "type": "terminator",
+  "config": {
+    "listen": "auto",
+    "certs": {
+      "default": {
+        "cert": "server.crt",
+        "key": "server.key"
+      }
+    },
+    "debug": false,
+    "debug_packet_limit": 100
+  }
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `listen` | Internal listener address (`auto` for ephemeral port) |
+| `certs.default` | Fallback certificate configuration |
+| `certs.targets` | Per-backend certificate configurations |
+| `debug` | Enable Hytale protocol packet logging |
+| `debug_packet_limit` | Max packets to log per stream (0 = unlimited) |
+
+See [TLS Termination](./tls-termination.md) for detailed configuration and packet handlers.
 
 ## Writing custom handlers
 
