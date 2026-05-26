@@ -1,5 +1,7 @@
 package handler
 
+import "context"
+
 // Action represents the result action from a handler.
 type Action int
 
@@ -52,6 +54,12 @@ type Handler interface {
 	OnDisconnect(ctx *Context)
 }
 
+// ShutdownHandler is implemented by handlers that own background resources
+// which should be released on proxy reload or shutdown.
+type ShutdownHandler interface {
+	Shutdown(ctx context.Context) error
+}
+
 // Chain executes handlers in sequence.
 type Chain struct {
 	handlers []Handler
@@ -96,4 +104,19 @@ func (c *Chain) OnDisconnect(ctx *Context) {
 // Handlers returns the list of handlers in the chain.
 func (c *Chain) Handlers() []Handler {
 	return c.handlers
+}
+
+// Shutdown releases resources owned by handlers that implement ShutdownHandler.
+func (c *Chain) Shutdown(ctx context.Context) error {
+	var firstErr error
+	for _, h := range c.handlers {
+		shutdown, ok := h.(ShutdownHandler)
+		if !ok {
+			continue
+		}
+		if err := shutdown.Shutdown(ctx); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }

@@ -3,6 +3,7 @@ package handler
 import (
 	"encoding/json"
 	"log"
+	"strconv"
 )
 
 func init() {
@@ -26,7 +27,7 @@ func (h *LogSNIHandler) OnConnect(ctx *Context) Result {
 	if ctx.Hello != nil {
 		sni = ctx.Hello.SNI
 	}
-	log.Printf("[sni] %s", sni)
+	log.Printf("[sni] %s", strconv.QuoteToASCII(sni))
 	return Result{Action: Continue}
 }
 

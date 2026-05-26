@@ -14,6 +14,7 @@
 {
   "listen": ":5520",
   "session_timeout": 600,
+  "allow_connection_migration": false,
   "handlers": [
     {
       "type": "handler-name",
@@ -53,6 +54,24 @@ Default: `7200` (2 hours)
 
 This value can be changed via hot-reload.
 
+### allow_connection_migration
+
+Allow an established QUIC session to continue if packets start arriving from a
+different client IP or UDP port.
+
+```json
+{"allow_connection_migration": false}
+```
+
+Default: `false`
+
+Leave this disabled unless you explicitly want to accept NAT rebinding / client
+network-path changes for live sessions. Enabling it can improve resilience for
+mobile clients and aggressive NATs, but this proxy does not validate QUIC path
+migration on its own, so accepting rebinding weakens session integrity.
+
+This value can be changed via hot-reload.
+
 ### handlers
 
 Array of handler configurations. See [Handlers](./handlers.md) for details.
@@ -76,6 +95,7 @@ systemctl reload quic-relay
 
 What can be hot-reloaded:
 - `session_timeout`
+- `allow_connection_migration`
 - Handler configurations (routes, limits)
 
 What requires restart:

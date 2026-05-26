@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"net"
 	"testing"
 	"time"
@@ -14,6 +15,7 @@ type mockHandler struct {
 	connectCalled    bool
 	packetCalled     bool
 	disconnectCalled bool
+	shutdownCalled   bool
 }
 
 func newMockHandler(name string, connectAction, packetAction Action) *mockHandler {
@@ -38,6 +40,11 @@ func (h *mockHandler) OnPacket(ctx *Context, packet []byte, dir Direction) Resul
 
 func (h *mockHandler) OnDisconnect(ctx *Context) {
 	h.disconnectCalled = true
+}
+
+func (h *mockHandler) Shutdown(ctx context.Context) error {
+	h.shutdownCalled = true
+	return nil
 }
 
 func TestChain_OnConnect_Continue(t *testing.T) {
@@ -302,4 +309,32 @@ func TestContext_Concurrent(t *testing.T) {
 	<-done
 
 	// If we get here without race detector complaints, test passes
+}
+
+func TestLogSNIHandler_Name(t *testing.T) {
+	h, err := NewLogSNIHandler(nil)
+	if err != nil {
+		t.Fatalf("failed to create logsni handler: %v", err)
+	}
+
+	if h.Name() != "logsni" {
+		t.Fatalf("expected handler name logsni, got %q", h.Name())
+	}
+}
+
+func TestChain_Shutdown(t *testing.T) {
+	h1 := newMockHandler("h1", Continue, Continue)
+	h2 := newMockHandler("h2", Continue, Continue)
+
+	chain := NewChain(h1, h2)
+	if err := chain.Shutdown(context.Background()); err != nil {
+		t.Fatalf("unexpected shutdown error: %v", err)
+	}
+
+	if !h1.shutdownCalled {
+		t.Fatal("expected h1 shutdown to be called")
+	}
+	if !h2.shutdownCalled {
+		t.Fatal("expected h2 shutdown to be called")
+	}
 }

@@ -5,6 +5,12 @@ import (
 	"fmt"
 )
 
+const (
+	sessionCountKey       = "_session_count"
+	sessionReservedKey    = "_session_reserved"
+	reserveSessionSlotKey = "_reserve_session_slot"
+)
+
 func init() {
 	Register("ratelimit-global", NewRateLimitGlobalHandler)
 }
@@ -41,7 +47,16 @@ func (h *RateLimitGlobalHandler) Name() string {
 
 // OnConnect checks if the connection limit has been reached.
 func (h *RateLimitGlobalHandler) OnConnect(ctx *Context) Result {
-	currentCount := ctx.GetInt64("_session_count")
+	if reserve, ok := GetValue[func(int64) bool](ctx, reserveSessionSlotKey); ok {
+		if !reserve(h.maxParallelConnections) {
+			currentCount := ctx.GetInt64(sessionCountKey)
+			return Result{Action: Drop, Error: fmt.Errorf("max connections exceeded (%d/%d)", currentCount, h.maxParallelConnections)}
+		}
+		ctx.Set(sessionReservedKey, true)
+		return Result{Action: Continue}
+	}
+
+	currentCount := ctx.GetInt64(sessionCountKey)
 	if currentCount >= h.maxParallelConnections {
 		return Result{Action: Drop, Error: fmt.Errorf("max connections exceeded (%d/%d)", currentCount, h.maxParallelConnections)}
 	}

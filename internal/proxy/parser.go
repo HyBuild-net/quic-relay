@@ -323,17 +323,29 @@ func ExtractCryptoFramesFromPacket(packet []byte) ([]CryptoFrame, error) {
 	}
 	scidLen := int(packet[offset])
 	offset++
+	if offset+scidLen > len(packet) {
+		return nil, errors.New("packet too short for SCID")
+	}
 	offset += scidLen
 
 	// Token Length
+	if offset > len(packet) {
+		return nil, errors.New("packet too short for token length")
+	}
 	tokenLen, n, err := readVarInt(packet[offset:])
 	if err != nil {
 		return nil, fmt.Errorf("failed to read token length: %w", err)
 	}
 	offset += n
+	if tokenLen > uint64(len(packet)-offset) {
+		return nil, errors.New("packet too short for token")
+	}
 	offset += int(tokenLen)
 
 	// Payload Length
+	if offset > len(packet) {
+		return nil, errors.New("packet too short for payload length")
+	}
 	payloadLen, n, err := readVarInt(packet[offset:])
 	if err != nil {
 		return nil, fmt.Errorf("failed to read payload length: %w", err)
@@ -760,7 +772,7 @@ func parseTLSClientHello(data []byte) (*handler.ClientHello, error) {
 
 	// Parse extensions
 	hello := &handler.ClientHello{
-		Raw: data,
+		Raw: append([]byte(nil), data...),
 	}
 
 	extEnd := offset + extensionsLen

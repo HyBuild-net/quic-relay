@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
+	"strconv"
 
 	terminator "quic-terminator"
 )
@@ -119,7 +120,8 @@ func (h *TerminatorHandler) OnConnect(ctx *Context) Result {
 	if len(dcid) > 8 {
 		dcidShort = dcid[:8]
 	}
-	log.Printf("[terminator] %s (dcid=%s) → %s (via %s)", sni, dcidShort, backend, h.term.InternalAddr)
+	log.Printf("[terminator] %s (dcid=%s) → %s (via %s)",
+		strconv.QuoteToASCII(sni), dcidShort, backend, h.term.InternalAddr)
 
 	// Redirect to internal listener
 	ctx.Set("backend", h.term.InternalAddr)

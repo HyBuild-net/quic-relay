@@ -1,10 +1,29 @@
 package proxy
 
 import (
+	"context"
+	"net"
 	"quic-relay/internal/handler"
 	"testing"
 	"time"
 )
+
+type shutdownTestHandler struct {
+	shutdownCalled bool
+}
+
+func (h *shutdownTestHandler) Name() string { return "shutdown-test" }
+func (h *shutdownTestHandler) OnConnect(ctx *handler.Context) handler.Result {
+	return handler.Result{Action: handler.Continue}
+}
+func (h *shutdownTestHandler) OnPacket(ctx *handler.Context, packet []byte, dir handler.Direction) handler.Result {
+	return handler.Result{Action: handler.Continue}
+}
+func (h *shutdownTestHandler) OnDisconnect(ctx *handler.Context) {}
+func (h *shutdownTestHandler) Shutdown(ctx context.Context) error {
+	h.shutdownCalled = true
+	return nil
+}
 
 func TestCryptoAssembler_AddFrame(t *testing.T) {
 	assembler := NewCryptoAssembler()
@@ -177,4 +196,175 @@ func TestBufferPool(t *testing.T) {
 
 	// PutBuffer with nil should not panic
 	handler.PutBuffer(nil)
+}
+
+func TestHandlePacket_EmptyPacketDoesNotPanic(t *testing.T) {
+	p := New(":0", handler.NewChain())
+	clientAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}
+
+	p.handlePacket(clientAddr, nil)
+	p.handlePacket(clientAddr, []byte{})
+}
+
+func TestStoreAssembler_EnforcesHardCap(t *testing.T) {
+	p := New(":0", handler.NewChain())
+	p.assemblerCount.Store(maxAssemblers)
+
+	if p.storeAssembler("dcid-1", NewCryptoAssembler()) {
+		t.Fatal("expected storeAssembler to reject inserts at hard cap")
+	}
+
+	if _, ok := p.assemblers.Load("dcid-1"); ok {
+		t.Fatal("assembler should not be stored when cap is reached")
+	}
+}
+
+func TestDeleteAssembler_DecrementsCount(t *testing.T) {
+	p := New(":0", handler.NewChain())
+
+	if !p.storeAssembler("dcid-1", NewCryptoAssembler()) {
+		t.Fatal("expected assembler to be stored")
+	}
+
+	if got := p.assemblerCount.Load(); got != 1 {
+		t.Fatalf("expected assemblerCount=1, got %d", got)
+	}
+
+	p.deleteAssembler("dcid-1")
+	p.deleteAssembler("dcid-1")
+
+	if got := p.assemblerCount.Load(); got != 0 {
+		t.Fatalf("expected assemblerCount=0 after delete, got %d", got)
+	}
+}
+
+func TestDeleteSession_RemovesTrackedAliases(t *testing.T) {
+	p := New(":0", handler.NewChain())
+	ctx := &handler.Context{
+		Session: &handler.Session{},
+	}
+	ctx.Session.SetClientAddr(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345})
+
+	p.sessions.Store("dcid-1", ctx)
+	p.sessionCount.Store(1)
+	p.clientSessions.Store(ctx.Session.ClientAddr().String(), "dcid-1")
+	p.dcidAliases.Store("alias-1", "dcid-1")
+	p.dcidAliases.Store("alias-2", "dcid-1")
+	p.trackSessionAlias("dcid-1", "alias-1")
+	p.trackSessionAlias("dcid-1", "alias-2")
+
+	p.deleteSession("dcid-1", ctx)
+
+	if _, ok := p.dcidAliases.Load("alias-1"); ok {
+		t.Fatal("expected alias-1 to be removed with the session")
+	}
+	if _, ok := p.dcidAliases.Load("alias-2"); ok {
+		t.Fatal("expected alias-2 to be removed with the session")
+	}
+	if _, ok := p.sessionAliases.Load("dcid-1"); ok {
+		t.Fatal("expected tracked alias set to be removed with the session")
+	}
+}
+
+func TestStorePendingBuffer_EnforcesHardCap(t *testing.T) {
+	p := New(":0", handler.NewChain())
+	p.pendingCount.Store(maxPendingBuffers)
+
+	if p.storePendingBuffer("dcid-1", &pendingBuffer{}) {
+		t.Fatal("expected storePendingBuffer to reject inserts at hard cap")
+	}
+
+	if _, ok := p.pendingPackets.Load("dcid-1"); ok {
+		t.Fatal("pending buffer should not be stored when cap is reached")
+	}
+}
+
+func TestLoadAndDeletePendingBuffer_DecrementsCount(t *testing.T) {
+	p := New(":0", handler.NewChain())
+
+	if !p.storePendingBuffer("dcid-1", &pendingBuffer{}) {
+		t.Fatal("expected pending buffer to be stored")
+	}
+
+	if got := p.pendingCount.Load(); got != 1 {
+		t.Fatalf("expected pendingCount=1, got %d", got)
+	}
+
+	if _, ok := p.loadAndDeletePendingBuffer("dcid-1"); !ok {
+		t.Fatal("expected pending buffer to be deleted")
+	}
+
+	if got := p.pendingCount.Load(); got != 0 {
+		t.Fatalf("expected pendingCount=0 after delete, got %d", got)
+	}
+}
+
+func TestHandlePacket_DoesNotRebindSessionToNewClientAddressByDefault(t *testing.T) {
+	p := New(":0", handler.NewChain())
+	originalAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}
+	newAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 2), Port: 23456}
+	ctx := &handler.Context{
+		Session: &handler.Session{
+			DCID: []byte("dcid-1"),
+		},
+	}
+	ctx.Session.SetClientAddr(originalAddr)
+
+	p.sessions.Store("dcid-1", ctx)
+	p.clientSessions.Store(originalAddr.String(), "dcid-1")
+
+	packet := append([]byte{0x40}, []byte("dcid-1payload")...)
+	p.handlePacket(newAddr, packet)
+
+	currentAddr := ctx.Session.ClientAddr()
+	if !currentAddr.IP.Equal(originalAddr.IP) || currentAddr.Port != originalAddr.Port {
+		t.Fatal("expected session client address to remain unchanged")
+	}
+	if _, ok := p.clientSessions.Load(newAddr.String()); ok {
+		t.Fatal("expected new client address to not be associated with the session")
+	}
+}
+
+func TestHandlePacket_RebindsSessionWhenMigrationEnabled(t *testing.T) {
+	p := New(":0", handler.NewChain())
+	p.SetAllowConnectionMigration(true)
+
+	originalAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}
+	newAddr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 2), Port: 23456}
+	ctx := &handler.Context{
+		Session: &handler.Session{
+			DCID: []byte("dcid-1"),
+		},
+	}
+	ctx.Session.SetClientAddr(originalAddr)
+
+	p.sessions.Store("dcid-1", ctx)
+	p.clientSessions.Store(originalAddr.String(), "dcid-1")
+	p.registerDCIDLength(len("dcid-1"))
+
+	packet := append([]byte{0x40}, []byte("dcid-1payload")...)
+	p.handlePacket(newAddr, packet)
+
+	currentAddr := ctx.Session.ClientAddr()
+	if !currentAddr.IP.Equal(newAddr.IP) || currentAddr.Port != newAddr.Port {
+		t.Fatal("expected session client address to be updated when migration is enabled")
+	}
+	if _, ok := p.clientSessions.Load(newAddr.String()); !ok {
+		t.Fatal("expected new client address to be associated with the session")
+	}
+}
+
+func TestReloadChain_ShutsDownRetiredChainWithoutSessions(t *testing.T) {
+	oldHandler := &shutdownTestHandler{}
+	newHandler := &shutdownTestHandler{}
+
+	p := New(":0", handler.NewChain(oldHandler))
+	p.ReloadChain(handler.NewChain(newHandler))
+
+	if !oldHandler.shutdownCalled {
+		t.Fatal("expected old chain resources to be shut down on reload")
+	}
+	if newHandler.shutdownCalled {
+		t.Fatal("did not expect new chain to be shut down")
+	}
 }

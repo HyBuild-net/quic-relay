@@ -25,6 +25,7 @@ type Config struct {
 	Listen         string                  `json:"listen"`
 	Handlers       []handler.HandlerConfig `json:"handlers"`
 	SessionTimeout int                     `json:"session_timeout,omitempty"` // Idle timeout in seconds (default: 600)
+	AllowConnectionMigration bool          `json:"allow_connection_migration,omitempty"`
 }
 
 // LoadConfig loads configuration from a JSON file.
@@ -70,6 +71,7 @@ const (
 	// Bounds for maps to prevent unbounded memory growth
 	maxSessions       = 100000
 	maxAssemblers     = 50000
+	maxPendingBuffers = 50000
 	maxPendingPerDCID = 10 // Max buffered packets per DCID
 	cleanupInterval   = 30 * time.Second
 )
@@ -84,6 +86,12 @@ type pendingBuffer struct {
 	packets   []pendingPacket
 	createdAt time.Time
 	mu        sync.Mutex
+}
+
+// aliasSet tracks server-issued aliases that belong to a single session.
+type aliasSet struct {
+	aliases map[string]struct{}
+	mu      sync.Mutex
 }
 
 // NewCryptoAssembler creates a new assembler with pre-allocated buffer
@@ -246,15 +254,22 @@ type Proxy struct {
 	conn           *net.UDPConn
 	chain          atomic.Pointer[handler.Chain] // Atomic for hot reload
 	sessionTimeout atomic.Int64                  // Idle timeout in seconds (atomic for hot reload)
+	allowConnectionMigration atomic.Bool         // Whether established sessions may rebind to new client addresses
 	sessions       sync.Map                      // DCID (string) -> *handler.Context
 	sessionCount   atomic.Int64                  // O(1) session counter
 	assemblers     sync.Map                      // DCID (string) -> *CryptoAssembler
+	assemblerCount atomic.Int64                  // O(1) assembler counter for hard memory cap
 	pendingPackets sync.Map                      // DCID (string) -> *pendingBuffer (out-of-order packets)
+	pendingCount   atomic.Int64                  // O(1) pending buffer counter for hard memory cap
 	dcidAliases    sync.Map                      // Server SCID (string) -> original DCID (string)
+	sessionAliases sync.Map                      // Original DCID (string) -> *aliasSet
 	clientSessions sync.Map                      // Client address (string) -> original DCID (string)
 	workerPool     *WorkerPool
 	ctx            context.Context
 	cancel         context.CancelFunc
+	chainRefsMu    sync.Mutex
+	chainRefs      map[*handler.Chain]int
+	retiredChains  map[*handler.Chain]struct{}
 
 	// DCID length tracking for Short Header parsing
 	dcidLengths   map[int]struct{}
@@ -267,12 +282,15 @@ const defaultSessionTimeout = 7200 // 2 hours in seconds
 func New(listenAddr string, chain *handler.Chain) *Proxy {
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &Proxy{
-		listenAddr:  listenAddr,
-		dcidLengths: make(map[int]struct{}),
-		ctx:         ctx,
-		cancel:      cancel,
+		listenAddr:   listenAddr,
+		dcidLengths:  make(map[int]struct{}),
+		ctx:          ctx,
+		cancel:       cancel,
+		chainRefs:    make(map[*handler.Chain]int),
+		retiredChains: make(map[*handler.Chain]struct{}),
 	}
 	p.chain.Store(chain)
+	p.chainRefs[chain] = 0
 	p.sessionTimeout.Store(defaultSessionTimeout)
 	return p
 }
@@ -286,10 +304,28 @@ func (p *Proxy) SetSessionTimeout(seconds int) {
 	p.sessionTimeout.Store(int64(seconds))
 }
 
+// SetAllowConnectionMigration updates whether live sessions may rebind to a new
+// client address. Disabled by default because this proxy does not validate QUIC
+// migration paths before accepting them.
+func (p *Proxy) SetAllowConnectionMigration(allow bool) {
+	p.allowConnectionMigration.Store(allow)
+}
+
 // ReloadChain atomically replaces the handler chain.
 // Existing sessions continue with their established connections.
 func (p *Proxy) ReloadChain(chain *handler.Chain) {
+	oldChain := p.chain.Load()
 	p.chain.Store(chain)
+
+	p.chainRefsMu.Lock()
+	if _, ok := p.chainRefs[chain]; !ok {
+		p.chainRefs[chain] = 0
+	}
+	p.chainRefsMu.Unlock()
+
+	if oldChain != nil && oldChain != chain {
+		p.retireChain(oldChain)
+	}
 }
 
 // Run starts the proxy server.
@@ -357,6 +393,11 @@ func (p *Proxy) Run() error {
 // Uses QUIC Connection ID (DCID) for session lookup instead of IP:Port.
 // This enables Connection Migration (RFC 9000 Section 9).
 func (p *Proxy) handlePacket(clientAddr *net.UDPAddr, packet []byte) {
+	if len(packet) == 0 {
+		debug.Printf(" received empty packet from %s", clientAddr)
+		return
+	}
+
 	// DEBUG: Log packet reception
 	debug.Printf(" received %d bytes from %s, first byte: 0x%02x", len(packet), clientAddr, packet[0])
 
@@ -366,9 +407,16 @@ func (p *Proxy) handlePacket(clientAddr *net.UDPAddr, packet []byte) {
 	// 1. Try to find existing session by DCID (with client address fallback)
 	ctx, dcid := p.findSession(packet, pktType, clientAddr)
 	if ctx != nil {
-		// Connection Migration: update client address if changed (atomic)
+		// Reject rebinding established sessions to a new client address unless
+		// explicitly enabled. This proxy does not validate QUIC migration paths.
 		currentAddr := ctx.Session.ClientAddr()
 		if !currentAddr.IP.Equal(clientAddr.IP) || currentAddr.Port != clientAddr.Port {
+			if !p.allowConnectionMigration.Load() {
+				log.Printf("[proxy] dropping packet from unexpected client address: %s (expected %s, DCID=%x)",
+					clientAddr, currentAddr, ctx.Session.DCID)
+				return
+			}
+
 			log.Printf("[proxy] connection migration: %s -> %s (DCID=%x)",
 				currentAddr, clientAddr, ctx.Session.DCID)
 			ctx.Session.SetClientAddr(clientAddr)
@@ -382,7 +430,7 @@ func (p *Proxy) handlePacket(clientAddr *net.UDPAddr, packet []byte) {
 		}
 
 		// Forward packet through handler chain
-		result := p.chain.Load().OnPacket(ctx, packet, handler.Inbound)
+		result := p.contextChain(ctx).OnPacket(ctx, packet, handler.Inbound)
 		if result.Action == handler.Drop && result.Error != nil {
 			log.Printf("[proxy] packet dropped: %v", result.Error)
 		}
@@ -414,14 +462,20 @@ func (p *Proxy) handlePacket(clientAddr *net.UDPAddr, packet []byte) {
 	dcidKey := string(dcid)
 
 	// 3. Try to parse ClientHello from Initial packet
-	assemblerVal, loaded := p.assemblers.LoadOrStore(dcidKey, NewCryptoAssembler())
-	assembler := assemblerVal.(*CryptoAssembler)
+	assembler, loaded, ok := p.loadOrCreateAssembler(dcidKey)
+	if !ok {
+		debug.Printf(" assembler limit reached, dropping Initial for DCID=%x", dcid)
+		return
+	}
 
 	// Check for expired assembler
 	if loaded && assembler.IsExpired() {
-		p.assemblers.Delete(dcidKey)
+		p.deleteAssembler(dcidKey)
 		assembler = NewCryptoAssembler()
-		p.assemblers.Store(dcidKey, assembler)
+		if !p.storeAssembler(dcidKey, assembler) {
+			debug.Printf(" assembler limit reached while replacing expired assembler for DCID=%x", dcid)
+			return
+		}
 	}
 
 	// If assembler is complete, we already have the ClientHello
@@ -449,11 +503,12 @@ func (p *Proxy) handlePacket(clientAddr *net.UDPAddr, packet []byte) {
 	debug.Printf(" parsed ClientHello: SNI=%q ALPN=%v", hello.SNI, hello.ALPNProtocols)
 
 	// Clean up assembler
-	p.assemblers.Delete(dcidKey)
+	p.deleteAssembler(dcidKey)
 
 	log.Printf("[proxy] new connection: SNI=%q DCID=%x", hello.SNI, dcid)
 
 	// Create context with DCID
+	currentChain := p.chain.Load()
 	newCtx := &handler.Context{
 		ClientAddr:    clientAddr,
 		InitialPacket: packet,
@@ -462,6 +517,8 @@ func (p *Proxy) handlePacket(clientAddr *net.UDPAddr, packet []byte) {
 	}
 	// Set session count for rate limiters
 	newCtx.Set("_session_count", p.sessionCount.Load())
+	newCtx.Set("_reserve_session_slot", p.tryReserveSessionSlot)
+	newCtx.Set("_chain", currentChain)
 
 	// Set callback to learn server's SCID(s) from response packets
 	// This enables routing subsequent client packets that use server's CID
@@ -470,8 +527,9 @@ func (p *Proxy) handlePacket(clientAddr *net.UDPAddr, packet []byte) {
 	}
 
 	// Process through handler chain
-	result := p.chain.Load().OnConnect(newCtx)
+	result := currentChain.OnConnect(newCtx)
 	if result.Action == handler.Drop {
+		p.releaseReservedSessionSlot(newCtx)
 		if result.Error != nil {
 			log.Printf("[proxy] connection dropped: %v", result.Error)
 		}
@@ -488,6 +546,7 @@ func (p *Proxy) handlePacket(clientAddr *net.UDPAddr, packet []byte) {
 
 		// Store session by DCID
 		p.storeSession(dcidKey, newCtx)
+		p.retainChain(currentChain)
 
 		// Also store by client address for fallback lookup
 		// (handles cases where client uses CIDs we don't know about)
@@ -499,9 +558,11 @@ func (p *Proxy) handlePacket(clientAddr *net.UDPAddr, packet []byte) {
 
 		// Set DropSession callback for immediate session termination by handlers
 		newCtx.DropSession = func() {
-			p.chain.Load().OnDisconnect(newCtx)
+			p.contextChain(newCtx).OnDisconnect(newCtx)
 			p.deleteSession(dcidKey, newCtx)
 		}
+	} else {
+		p.releaseReservedSessionSlot(newCtx)
 	}
 }
 
@@ -641,6 +702,7 @@ func (p *Proxy) learnServerSCID(originalDCID string, ctx *handler.Context, datag
 
 		// Store alias: server's SCID -> original DCID
 		p.dcidAliases.Store(scidKey, originalDCID)
+		p.trackSessionAlias(originalDCID, scidKey)
 
 		// Track SCID length for Short Header parsing
 		p.registerDCIDLength(len(scid))
@@ -667,10 +729,15 @@ func (p *Proxy) Stop() {
 	// 4. Cleanup all sessions (now safe - no more packet processing)
 	p.sessions.Range(func(key, value any) bool {
 		ctx := value.(*handler.Context)
-		p.chain.Load().OnDisconnect(ctx)
+		p.contextChain(ctx).OnDisconnect(ctx)
 		p.deleteSession(key.(string), ctx)
 		return true
 	})
+
+	p.shutdownRetiredChains()
+	if current := p.chain.Load(); current != nil {
+		p.shutdownChain(current)
+	}
 }
 
 // cleanupSessions periodically removes stale sessions and expired assemblers.
@@ -690,7 +757,7 @@ func (p *Proxy) cleanupSessions() {
 				if ctx.Session != nil {
 					if ctx.Session.IdleDuration() > timeout {
 						log.Printf("[proxy] cleaning up idle session: %s (idle %v)", key, ctx.Session.IdleDuration())
-						p.chain.Load().OnDisconnect(ctx)
+						p.contextChain(ctx).OnDisconnect(ctx)
 						p.deleteSession(key.(string), ctx)
 					}
 				}
@@ -702,7 +769,7 @@ func (p *Proxy) cleanupSessions() {
 			p.assemblers.Range(func(key, value any) bool {
 				assembler := value.(*CryptoAssembler)
 				if assembler.IsExpired() {
-					p.assemblers.Delete(key)
+					p.deleteAssembler(key.(string))
 				} else {
 					assemblerCount++
 				}
@@ -715,7 +782,7 @@ func (p *Proxy) cleanupSessions() {
 				p.assemblers.Range(func(key, value any) bool {
 					assembler := value.(*CryptoAssembler)
 					if assembler.IsComplete() || time.Since(assembler.createdAt) > 2*time.Second {
-						p.assemblers.Delete(key)
+						p.deleteAssembler(key.(string))
 					}
 					return true
 				})
@@ -725,11 +792,56 @@ func (p *Proxy) cleanupSessions() {
 			p.pendingPackets.Range(func(key, value any) bool {
 				buf := value.(*pendingBuffer)
 				if time.Since(buf.createdAt) > assemblerTimeout {
-					p.pendingPackets.Delete(key)
+					p.deletePendingBuffer(key.(string))
 				}
 				return true
 			})
 		}
+	}
+}
+
+// loadOrCreateAssembler returns the existing assembler for a DCID or creates one
+// while enforcing a hard global cap on outstanding assemblers.
+func (p *Proxy) loadOrCreateAssembler(key string) (*CryptoAssembler, bool, bool) {
+	if val, ok := p.assemblers.Load(key); ok {
+		return val.(*CryptoAssembler), true, true
+	}
+
+	assembler := NewCryptoAssembler()
+	if !p.storeAssembler(key, assembler) {
+		if val, ok := p.assemblers.Load(key); ok {
+			return val.(*CryptoAssembler), true, true
+		}
+		return nil, false, false
+	}
+
+	return assembler, false, true
+}
+
+// storeAssembler stores a new assembler if the hard cap allows it.
+func (p *Proxy) storeAssembler(key string, assembler *CryptoAssembler) bool {
+	for {
+		count := p.assemblerCount.Load()
+		if count >= maxAssemblers {
+			return false
+		}
+		if p.assemblerCount.CompareAndSwap(count, count+1) {
+			break
+		}
+	}
+
+	if _, loaded := p.assemblers.LoadOrStore(key, assembler); loaded {
+		p.assemblerCount.Add(-1)
+		return false
+	}
+
+	return true
+}
+
+// deleteAssembler removes an assembler and decrements the counter once.
+func (p *Proxy) deleteAssembler(key string) {
+	if _, loaded := p.assemblers.LoadAndDelete(key); loaded {
+		p.assemblerCount.Add(-1)
 	}
 }
 
@@ -748,11 +860,44 @@ func (p *Proxy) SessionCount() int {
 	return int(p.sessionCount.Load())
 }
 
+func (p *Proxy) contextChain(ctx *handler.Context) *handler.Chain {
+	if ctx != nil {
+		if chain, ok := handler.GetValue[*handler.Chain](ctx, "_chain"); ok && chain != nil {
+			return chain
+		}
+	}
+	return p.chain.Load()
+}
+
+// tryReserveSessionSlot atomically reserves one session slot if below limit.
+func (p *Proxy) tryReserveSessionSlot(limit int64) bool {
+	for {
+		current := p.sessionCount.Load()
+		if current >= limit {
+			return false
+		}
+		if p.sessionCount.CompareAndSwap(current, current+1) {
+			return true
+		}
+	}
+}
+
+// releaseReservedSessionSlot releases a slot that was reserved during OnConnect
+// but never became a stored session.
+func (p *Proxy) releaseReservedSessionSlot(ctx *handler.Context) {
+	if ctx == nil || !ctx.GetBool("_session_reserved") {
+		return
+	}
+	ctx.Set("_session_reserved", false)
+	p.sessionCount.Add(-1)
+}
+
 // deleteSession removes a session and decrements the counter.
-// Note: DCID aliases are cleaned up by timeout-based cleanup.
 func (p *Proxy) deleteSession(key string, ctx *handler.Context) {
 	if _, loaded := p.sessions.LoadAndDelete(key); loaded {
 		p.sessionCount.Add(-1)
+		p.deleteSessionAliases(key)
+		p.releaseChain(ctx)
 
 		// O(1) - directly delete using known client address from context
 		if ctx != nil && ctx.Session != nil {
@@ -766,8 +911,12 @@ func (p *Proxy) deleteSession(key string, ctx *handler.Context) {
 // storeSession stores a session with bounds checking.
 // Triggers cleanup if limit is approached.
 func (p *Proxy) storeSession(key string, ctx *handler.Context) {
-	// O(1) increment
-	count := p.sessionCount.Add(1)
+	var count int64
+	if ctx != nil && ctx.GetBool("_session_reserved") {
+		count = p.sessionCount.Load()
+	} else {
+		count = p.sessionCount.Add(1)
+	}
 
 	// Approaching limit - cleanup oldest 10%
 	if count >= maxSessions*9/10 {
@@ -777,13 +926,125 @@ func (p *Proxy) storeSession(key string, ctx *handler.Context) {
 	p.sessions.Store(key, ctx)
 }
 
+func (p *Proxy) retainChain(chain *handler.Chain) {
+	if chain == nil {
+		return
+	}
+	p.chainRefsMu.Lock()
+	p.chainRefs[chain]++
+	p.chainRefsMu.Unlock()
+}
+
+func (p *Proxy) releaseChain(ctx *handler.Context) {
+	chain := p.contextChain(ctx)
+	if chain == nil {
+		return
+	}
+
+	var shutdown bool
+	p.chainRefsMu.Lock()
+	if refs, ok := p.chainRefs[chain]; ok {
+		if refs > 0 {
+			refs--
+			p.chainRefs[chain] = refs
+		}
+		if refs == 0 {
+			if _, retired := p.retiredChains[chain]; retired {
+				delete(p.retiredChains, chain)
+				delete(p.chainRefs, chain)
+				shutdown = true
+			}
+		}
+	}
+	p.chainRefsMu.Unlock()
+
+	if shutdown {
+		p.shutdownChain(chain)
+	}
+}
+
+func (p *Proxy) retireChain(chain *handler.Chain) {
+	if chain == nil {
+		return
+	}
+
+	var shutdown bool
+	p.chainRefsMu.Lock()
+	refs := p.chainRefs[chain]
+	if refs == 0 {
+		delete(p.chainRefs, chain)
+		shutdown = true
+	} else {
+		p.retiredChains[chain] = struct{}{}
+	}
+	p.chainRefsMu.Unlock()
+
+	if shutdown {
+		p.shutdownChain(chain)
+	}
+}
+
+func (p *Proxy) shutdownRetiredChains() {
+	p.chainRefsMu.Lock()
+	chains := make([]*handler.Chain, 0, len(p.retiredChains))
+	for chain := range p.retiredChains {
+		chains = append(chains, chain)
+		delete(p.retiredChains, chain)
+		delete(p.chainRefs, chain)
+	}
+	p.chainRefsMu.Unlock()
+
+	for _, chain := range chains {
+		p.shutdownChain(chain)
+	}
+}
+
+func (p *Proxy) shutdownChain(chain *handler.Chain) {
+	if chain == nil {
+		return
+	}
+	if err := chain.Shutdown(context.Background()); err != nil {
+		log.Printf("[proxy] handler shutdown failed: %v", err)
+	}
+}
+
+// trackSessionAlias records an alias for later cleanup when the session ends.
+func (p *Proxy) trackSessionAlias(originalDCID, alias string) {
+	val, _ := p.sessionAliases.LoadOrStore(originalDCID, &aliasSet{
+		aliases: make(map[string]struct{}),
+	})
+	set := val.(*aliasSet)
+
+	set.mu.Lock()
+	set.aliases[alias] = struct{}{}
+	set.mu.Unlock()
+}
+
+// deleteSessionAliases removes all aliases learned for a session.
+func (p *Proxy) deleteSessionAliases(originalDCID string) {
+	val, ok := p.sessionAliases.LoadAndDelete(originalDCID)
+	if !ok {
+		return
+	}
+
+	set := val.(*aliasSet)
+	set.mu.Lock()
+	defer set.mu.Unlock()
+
+	for alias := range set.aliases {
+		if mapped, ok := p.dcidAliases.Load(alias); ok && mapped.(string) == originalDCID {
+			p.dcidAliases.Delete(alias)
+		}
+	}
+}
+
 // bufferPendingPacket stores a packet that arrived before its session existed.
 // Used for out-of-order 0-RTT and Handshake packets.
 func (p *Proxy) bufferPendingPacket(dcidKey string, packet []byte) {
-	val, _ := p.pendingPackets.LoadOrStore(dcidKey, &pendingBuffer{
-		createdAt: time.Now(),
-	})
-	buf := val.(*pendingBuffer)
+	buf, ok := p.loadOrCreatePendingBuffer(dcidKey)
+	if !ok {
+		return
+	}
 
 	buf.mu.Lock()
 	defer buf.mu.Unlock()
@@ -799,7 +1060,7 @@ func (p *Proxy) bufferPendingPacket(dcidKey string, packet []byte) {
 
 // flushPendingPackets processes buffered packets after session creation.
 func (p *Proxy) flushPendingPackets(dcidKey string, ctx *handler.Context) {
-	val, ok := p.pendingPackets.LoadAndDelete(dcidKey)
+	val, ok := p.loadAndDeletePendingBuffer(dcidKey)
 	if !ok {
 		return
 	}
@@ -812,6 +1073,62 @@ func (p *Proxy) flushPendingPackets(dcidKey string, ctx *handler.Context) {
 
 	for _, pkt := range packets {
 		p.chain.Load().OnPacket(ctx, pkt.data, handler.Inbound)
+	}
+}
+
+// loadOrCreatePendingBuffer returns the existing pending buffer for a DCID or
+// creates one while enforcing a hard global cap on outstanding pending buffers.
+func (p *Proxy) loadOrCreatePendingBuffer(key string) (*pendingBuffer, bool) {
+	if val, ok := p.pendingPackets.Load(key); ok {
+		return val.(*pendingBuffer), true
+	}
+
+	buf := &pendingBuffer{
+		createdAt: time.Now(),
+	}
+	if !p.storePendingBuffer(key, buf) {
+		if val, ok := p.pendingPackets.Load(key); ok {
+			return val.(*pendingBuffer), true
+		}
+		return nil, false
+	}
+
+	return buf, true
+}
+
+// storePendingBuffer stores a new pending buffer if the hard cap allows it.
+func (p *Proxy) storePendingBuffer(key string, buf *pendingBuffer) bool {
+	for {
+		count := p.pendingCount.Load()
+		if count >= maxPendingBuffers {
+			return false
+		}
+		if p.pendingCount.CompareAndSwap(count, count+1) {
+			break
+		}
+	}
+
+	if _, loaded := p.pendingPackets.LoadOrStore(key, buf); loaded {
+		p.pendingCount.Add(-1)
+		return false
+	}
+
+	return true
+}
+
+// loadAndDeletePendingBuffer removes a pending buffer and decrements the counter once.
+func (p *Proxy) loadAndDeletePendingBuffer(key string) (any, bool) {
+	val, ok := p.pendingPackets.LoadAndDelete(key)
+	if ok {
+		p.pendingCount.Add(-1)
+	}
+	return val, ok
+}
+
+// deletePendingBuffer removes a pending buffer and decrements the counter once.
+func (p *Proxy) deletePendingBuffer(key string) {
+	if _, ok := p.loadAndDeletePendingBuffer(key); ok {
+		return
 	}
 }
 
@@ -879,7 +1196,7 @@ func (p *Proxy) cleanupOldestSessions(n int) {
 		age := heap.Pop(h).(sessionAge)
 		if val, ok := p.sessions.Load(age.key); ok {
 			ctx := val.(*handler.Context)
-			p.chain.Load().OnDisconnect(ctx)
+			p.contextChain(ctx).OnDisconnect(ctx)
 			p.deleteSession(age.key, ctx)
 			removed++
 		}

@@ -53,6 +53,7 @@ func main() {
 
 	p := proxy.New(cfg.Listen, chain)
 	p.SetSessionTimeout(cfg.SessionTimeout)
+	p.SetAllowConnectionMigration(cfg.AllowConnectionMigration)
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
@@ -77,7 +78,9 @@ func main() {
 				}
 				p.ReloadChain(newChain)
 				p.SetSessionTimeout(newCfg.SessionTimeout)
-				log.Printf("[proxy] config reloaded, handlers: %v, session_timeout: %ds", handlerNames(newChain), newCfg.SessionTimeout)
+				p.SetAllowConnectionMigration(newCfg.AllowConnectionMigration)
+				log.Printf("[proxy] config reloaded, handlers: %v, session_timeout: %ds, allow_connection_migration: %t",
+					handlerNames(newChain), newCfg.SessionTimeout, newCfg.AllowConnectionMigration)
 			case syscall.SIGINT, syscall.SIGTERM:
 				log.Println("[proxy] shutting down...")
 				p.Stop()

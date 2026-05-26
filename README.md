@@ -170,11 +170,13 @@ See [docs/tls-termination.md](docs/tls-termination.md) for configuration.
 {
   "listen": ":5520",
   "session_timeout": 600,
+  "allow_connection_migration": false,
   "handlers": [...]
 }
 ```
 
 - `session_timeout` - Idle session timeout in seconds (default: `7200` = 2 hours). Sessions without traffic are cleaned up after this duration. Can be changed via hot-reload (SIGHUP).
+- `allow_connection_migration` - Whether established sessions may rebind to a new client IP/port (default: `false`). Enable only if you need live-session NAT rebinding / path changes and accept the weaker security posture.
 
 ### Environment Variables
 

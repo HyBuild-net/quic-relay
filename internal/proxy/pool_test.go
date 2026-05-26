@@ -150,3 +150,11 @@ func TestNewWorkerPool_Defaults(t *testing.T) {
 		t.Error("queuePerShard should be set to default when 0")
 	}
 }
+
+func TestNewWorkerPool_DefaultQueueSizeIsBounded(t *testing.T) {
+	pool := NewWorkerPool(4, 0, func(addr *net.UDPAddr, packet []byte) {})
+
+	if pool.queuePerShard != 256 {
+		t.Fatalf("expected queuePerShard=256, got %d", pool.queuePerShard)
+	}
+}

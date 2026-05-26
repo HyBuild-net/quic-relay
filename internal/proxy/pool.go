@@ -29,13 +29,13 @@ type WorkerPool struct {
 
 // NewWorkerPool creates a sharded worker pool.
 // workers: number of workers/shards (0 = NumCPU * 2)
-// queueSize: total queue capacity across all shards (0 = 10000)
+// queueSize: total queue capacity across all shards (0 = 1024)
 func NewWorkerPool(workers, queueSize int, handler func(*net.UDPAddr, []byte)) *WorkerPool {
 	if workers <= 0 {
 		workers = runtime.NumCPU() * 2
 	}
 	if queueSize <= 0 {
-		queueSize = 10000
+		queueSize = 1024
 	}
 
 	queuePerShard := queueSize / workers

@@ -95,3 +95,65 @@ func TestClassifyPacket(t *testing.T) {
 		})
 	}
 }
+
+func TestExtractCryptoFramesFromPacket_RejectsOversizedSCID(t *testing.T) {
+	packet := []byte{
+		0xC0,
+		0x00, 0x00, 0x00, 0x01,
+		0x00,
+		0x20,
+	}
+
+	_, err := ExtractCryptoFramesFromPacket(packet)
+	if err == nil {
+		t.Fatal("expected oversized SCID to return an error")
+	}
+}
+
+func TestExtractCryptoFramesFromPacket_RejectsOversizedToken(t *testing.T) {
+	packet := []byte{
+		0xC0,
+		0x00, 0x00, 0x00, 0x01,
+		0x00,
+		0x00,
+		0x40, 0x01,
+	}
+
+	_, err := ExtractCryptoFramesFromPacket(packet)
+	if err == nil {
+		t.Fatal("expected oversized token to return an error")
+	}
+}
+
+func TestParseTLSClientHello_CopiesRawBuffer(t *testing.T) {
+	data := make([]byte, 128)
+	data[0] = 0x01
+	data[1] = 0x00
+	data[2] = 0x00
+	data[3] = 0x2b
+	data[4] = 0x03
+	data[5] = 0x03
+	data[38] = 0x00
+	data[39] = 0x00
+	data[40] = 0x02
+	data[41] = 0x13
+	data[42] = 0x01
+	data[43] = 0x01
+	data[44] = 0x00
+	data[45] = 0x00
+	data[46] = 0x00
+
+	hello, err := parseTLSClientHello(data[:47])
+	if err != nil {
+		t.Fatalf("parseTLSClientHello failed: %v", err)
+	}
+
+	if len(hello.Raw) != 47 {
+		t.Fatalf("expected raw length 47, got %d", len(hello.Raw))
+	}
+
+	data[0] = 0x02
+	if hello.Raw[0] != 0x01 {
+		t.Fatal("expected ClientHello.Raw to be a detached copy")
+	}
+}

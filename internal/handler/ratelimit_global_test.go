@@ -108,3 +108,49 @@ func TestRateLimitGlobal_Name(t *testing.T) {
 		t.Errorf("expected name 'ratelimit-global', got '%s'", h.Name())
 	}
 }
+
+func TestRateLimitGlobal_ReservesSessionSlot(t *testing.T) {
+	h, err := NewRateLimitGlobalHandler(json.RawMessage(`{"max_parallel_connections": 10}`))
+	if err != nil {
+		t.Fatalf("failed to create handler: %v", err)
+	}
+
+	ctx := &Context{}
+	var reservedLimit int64
+	ctx.Set(reserveSessionSlotKey, func(limit int64) bool {
+		reservedLimit = limit
+		return true
+	})
+
+	result := h.OnConnect(ctx)
+	if result.Action != Continue {
+		t.Fatalf("expected Continue, got %v", result.Action)
+	}
+	if reservedLimit != 10 {
+		t.Fatalf("expected reservation to use limit 10, got %d", reservedLimit)
+	}
+	if !ctx.GetBool(sessionReservedKey) {
+		t.Fatal("expected context to mark the session as reserved")
+	}
+}
+
+func TestRateLimitGlobal_DropsWhenReservationFails(t *testing.T) {
+	h, err := NewRateLimitGlobalHandler(json.RawMessage(`{"max_parallel_connections": 10}`))
+	if err != nil {
+		t.Fatalf("failed to create handler: %v", err)
+	}
+
+	ctx := &Context{}
+	ctx.Set(sessionCountKey, int64(10))
+	ctx.Set(reserveSessionSlotKey, func(limit int64) bool {
+		return false
+	})
+
+	result := h.OnConnect(ctx)
+	if result.Action != Drop {
+		t.Fatalf("expected Drop, got %v", result.Action)
+	}
+	if result.Error == nil {
+		t.Fatal("expected error when reservation fails")
+	}
+}
