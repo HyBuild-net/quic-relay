@@ -323,29 +323,17 @@ func ExtractCryptoFramesFromPacket(packet []byte) ([]CryptoFrame, error) {
 	}
 	scidLen := int(packet[offset])
 	offset++
-	if offset+scidLen > len(packet) {
-		return nil, errors.New("packet too short for SCID")
-	}
 	offset += scidLen
 
 	// Token Length
-	if offset > len(packet) {
-		return nil, errors.New("packet too short for token length")
-	}
 	tokenLen, n, err := readVarInt(packet[offset:])
 	if err != nil {
 		return nil, fmt.Errorf("failed to read token length: %w", err)
 	}
 	offset += n
-	if tokenLen > uint64(len(packet)-offset) {
-		return nil, errors.New("packet too short for token")
-	}
 	offset += int(tokenLen)
 
 	// Payload Length
-	if offset > len(packet) {
-		return nil, errors.New("packet too short for payload length")
-	}
 	payloadLen, n, err := readVarInt(packet[offset:])
 	if err != nil {
 		return nil, fmt.Errorf("failed to read payload length: %w", err)
@@ -363,7 +351,7 @@ func ExtractCryptoFramesFromPacket(packet []byte) ([]CryptoFrame, error) {
 		return nil, fmt.Errorf("failed to derive keys: %w", err)
 	}
 
-	decrypted, err := decryptInitialPacket(packet, encrypted, clientKey, clientIV, clientHP)
+	decrypted, err := decryptInitialPacket(packet, encrypted, offset, clientKey, clientIV, clientHP)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decrypt: %w", err)
 	}
@@ -446,7 +434,7 @@ func hkdfExpandLabel(secret []byte, label string, context []byte, length int) ([
 }
 
 // decryptInitialPacket removes header protection and decrypts the payload.
-func decryptInitialPacket(packet, encrypted, key, iv, hp []byte) ([]byte, error) {
+func decryptInitialPacket(packet, encrypted []byte, pnOffset int, key, iv, hp []byte) ([]byte, error) {
 	if len(encrypted) < 20 {
 		return nil, errors.New("encrypted payload too short")
 	}
@@ -467,13 +455,13 @@ func decryptInitialPacket(packet, encrypted, key, iv, hp []byte) ([]byte, error)
 		return nil, err
 	}
 
-	return DecryptWithCachedCrypto(packet, encrypted, hpCipher, aead, iv)
+	return DecryptWithCachedCrypto(packet, encrypted, pnOffset, hpCipher, aead, iv)
 }
 
 // DecryptWithCachedCrypto decrypts an Initial packet using pre-derived keys.
 // This is faster than decryptInitialPacket as it reuses cipher objects.
 // Uses buffer pool to avoid per-packet allocations.
-func DecryptWithCachedCrypto(packet, encrypted []byte,
+func DecryptWithCachedCrypto(packet, encrypted []byte, pnOffset int,
 	hpCipher cipher.Block, aead cipher.AEAD, iv []byte) ([]byte, error) {
 
 	if len(encrypted) < 20 {
@@ -501,8 +489,7 @@ func DecryptWithCachedCrypto(packet, encrypted []byte,
 	// Determine packet number length
 	pnLen := (packetCopy[0] & 0x03) + 1
 
-	// Find packet number offset (need to recalculate)
-	pnOffset := len(packet) - len(encrypted)
+	// Packet number offset parsed from Initial packet header.
 
 	// Remove header protection from packet number
 	for i := 0; i < int(pnLen); i++ {
@@ -772,7 +759,7 @@ func parseTLSClientHello(data []byte) (*handler.ClientHello, error) {
 
 	// Parse extensions
 	hello := &handler.ClientHello{
-		Raw: append([]byte(nil), data...),
+		Raw: data,
 	}
 
 	extEnd := offset + extensionsLen
